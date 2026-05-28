@@ -1,10 +1,12 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Module 4: Report — Optimization Leaderboard
+# MAGIC # Report — Optimization Leaderboard
 # MAGIC
 # MAGIC **Audience:** All stakeholders
 # MAGIC
-# MAGIC **Key Metrics:** Actions taken by agent, $ saved, failures prevented
+# MAGIC Publishes stable SQL views into `intelliops.report.*` for the leaderboard
+# MAGIC dashboard tab. Prints a plain-English monthly digest at the end so the
+# MAGIC orchestrator run log doubles as an exec summary.
 
 # COMMAND ----------
 
@@ -12,103 +14,102 @@
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## View 1: Agent Activity Summary (Current Month)
+from datetime import datetime
 
 # COMMAND ----------
 
-df_summary = spark.sql(f"""
-    SELECT
-        skill_name,
-        action_type,
-        COUNT(*)                                                AS total_actions,
-        SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END)   AS applied,
-        SUM(CASE WHEN status = 'proposed' THEN 1 ELSE 0 END)   AS proposed,
-        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END)   AS rejected,
-        ROUND(SUM(projected_savings), 2)                        AS total_projected_savings
-    FROM {TABLE_AGENT_ACTIONS}
-    WHERE action_timestamp >= DATE_TRUNC('month', CURRENT_TIMESTAMP)
-    GROUP BY skill_name, action_type
-    ORDER BY total_projected_savings DESC
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {REPORT_SCHEMA}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View: `agent_activity_mtd` — current-month activity by skill / action type
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE OR REPLACE VIEW {REPORT_SCHEMA}.agent_activity_mtd AS
+SELECT
+    skill_name,
+    action_type,
+    COUNT(*)                                                AS total_actions,
+    SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END)    AS applied,
+    SUM(CASE WHEN status = 'proposed' THEN 1 ELSE 0 END)    AS proposed,
+    SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END)    AS rejected,
+    ROUND(SUM(projected_savings), 2)                        AS total_projected_savings
+FROM {TABLE_AGENT_ACTIONS}
+WHERE action_timestamp >= DATE_TRUNC('month', CURRENT_TIMESTAMP)
+GROUP BY skill_name, action_type
+ORDER BY total_projected_savings DESC
 """)
 
-print("Agent activity — current month:")
-df_summary.display()
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## View 2: Total Savings Captured
+# MAGIC ## View: `agent_monthly_savings_trend` — savings per month, all history
 
 # COMMAND ----------
 
-df_total_savings = spark.sql(f"""
-    SELECT
-        DATE_TRUNC('month', action_timestamp)               AS month,
-        ROUND(SUM(projected_savings), 2)                    AS total_savings,
-        COUNT(*)                                            AS total_actions,
-        SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END) AS applied_actions
-    FROM {TABLE_AGENT_ACTIONS}
-    GROUP BY DATE_TRUNC('month', action_timestamp)
-    ORDER BY month DESC
+spark.sql(f"""
+CREATE OR REPLACE VIEW {REPORT_SCHEMA}.agent_monthly_savings_trend AS
+SELECT
+    DATE_TRUNC('month', action_timestamp)               AS month,
+    ROUND(SUM(projected_savings), 2)                    AS total_savings,
+    COUNT(*)                                            AS total_actions,
+    SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END) AS applied_actions
+FROM {TABLE_AGENT_ACTIONS}
+GROUP BY DATE_TRUNC('month', action_timestamp)
+ORDER BY month DESC
 """)
 
-print("Monthly savings trend:")
-df_total_savings.display()
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## View 3: Recent Actions Timeline
+# MAGIC ## View: `agent_recent_actions` — last 50 actions
 
 # COMMAND ----------
 
-df_timeline = spark.sql(f"""
-    SELECT
-        action_timestamp,
-        skill_name,
-        action_type,
-        target_name,
-        description,
-        ROUND(projected_savings, 2)     AS savings,
-        status
-    FROM {TABLE_AGENT_ACTIONS}
-    ORDER BY action_timestamp DESC
-    LIMIT 50
+spark.sql(f"""
+CREATE OR REPLACE VIEW {REPORT_SCHEMA}.agent_recent_actions AS
+SELECT
+    action_timestamp,
+    skill_name,
+    action_type,
+    target_name,
+    description,
+    ROUND(projected_savings, 2)     AS savings,
+    status
+FROM {TABLE_AGENT_ACTIONS}
+ORDER BY action_timestamp DESC
+LIMIT 50
 """)
 
-print("Recent agent actions:")
-df_timeline.display()
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## View 4: Savings by Skill (Pie Chart Data)
+# MAGIC ## View: `agent_savings_by_skill` — current-month savings per skill
 
 # COMMAND ----------
 
-df_by_skill = spark.sql(f"""
-    SELECT
-        skill_name,
-        ROUND(SUM(projected_savings), 2)        AS total_savings,
-        COUNT(*)                                AS action_count
-    FROM {TABLE_AGENT_ACTIONS}
-    WHERE action_timestamp >= DATE_TRUNC('month', CURRENT_TIMESTAMP)
-    GROUP BY skill_name
-    ORDER BY total_savings DESC
+spark.sql(f"""
+CREATE OR REPLACE VIEW {REPORT_SCHEMA}.agent_savings_by_skill AS
+SELECT
+    skill_name,
+    ROUND(SUM(projected_savings), 2)        AS total_savings,
+    COUNT(*)                                AS action_count
+FROM {TABLE_AGENT_ACTIONS}
+WHERE action_timestamp >= DATE_TRUNC('month', CURRENT_TIMESTAMP)
+GROUP BY skill_name
+ORDER BY total_savings DESC
 """)
 
-print("Savings breakdown by skill:")
-df_by_skill.display()
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## View 5: Executive Narrative Digest
+# MAGIC ## Monthly executive digest (printed to run log, not a view)
 
 # COMMAND ----------
 
-# Generate a plain-English summary of this month's agent activity
 stats = spark.sql(f"""
     SELECT
         COUNT(*)                                            AS total_actions,
@@ -120,21 +121,24 @@ stats = spark.sql(f"""
     WHERE action_timestamp >= DATE_TRUNC('month', CURRENT_TIMESTAMP)
 """).first()
 
-if stats and stats["total_actions"] > 0:
-    narrative = f"""
+if stats and stats["total_actions"] and stats["total_actions"] > 0:
+    print(f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   IntelliOps Monthly Digest — {datetime.now().strftime('%B %Y')}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  This month, IntelliOps took {stats['total_actions']} actions
+  This month, IntelliOps recorded {stats['total_actions']} actions
   across {stats['unique_targets']} resources using {stats['skills_used']} skills.
 
-  {stats['applied']} action(s) were automatically applied.
+  {stats['applied']} action(s) were applied.
 
-  Projected savings: ${stats['total_savings']:,.0f}
+  Projected savings: ${(stats['total_savings'] or 0):,.0f}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    print(narrative)
+""")
 else:
     print("No agent actions recorded this month yet.")
+
+# COMMAND ----------
+
+print(f"Optimization Leaderboard views published under {REPORT_SCHEMA}.")

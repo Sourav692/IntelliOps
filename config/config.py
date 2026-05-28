@@ -16,6 +16,9 @@ TABLE_JOB_COST_TREND = f"{FULL_SCHEMA}.feat_job_cost_trend"
 TABLE_JOB_HEALTH = f"{FULL_SCHEMA}.feat_job_health"
 TABLE_AGENT_ACTIONS = f"{FULL_SCHEMA}.agent_action_log"
 
+# Report layer — stable SQL views that dashboards bind to
+REPORT_SCHEMA = f"{CATALOG}.report"
+
 # ── System Tables ───────────────────────────────────────────────────────────────
 SYS_BILLING_USAGE = "system.billing.usage"
 SYS_BILLING_PRICES = "system.billing.list_prices"
@@ -53,6 +56,7 @@ CLUSTER_IDLE_HOURS = 2               # Idle if no tasks for 2+ hours
 JOB_FAILURE_RISK_THRESHOLD = 0.7     # Alert if failure probability > 0.7
 JOB_DURATION_ANOMALY_SIGMA = 2       # Flag if duration > mean + 2σ
 JOB_HEALTH_LOOKBACK_DAYS = 30        # Look back 30 days for health metrics
+SLA_DURATION_MINUTES = 60            # Flag jobs whose avg duration exceeds this SLA
 
 # COMMAND ----------
 

@@ -88,6 +88,8 @@ This creates: `intelliops.feature_store.{feat_cluster_utilization, feat_job_cost
 
 `orchestrator.py` runs the **scheduled** stages only: **Observe → Knowledge → Report**. The support agent itself is event-driven (see §6) and is *not* invoked here.
 
+> **What runs today:** only Observe and Report. Knowledge is **wired into the orchestrator but its notebook (`02_knowledge/01_build_knowledge_index`) does not exist yet** — that module is a placeholder (see §10). `RUN_KNOWLEDGE` therefore defaults to `False`; flip it to `True` only after the Knowledge module is implemented.
+
 ### Option A — Manual run (good for first validation)
 
 Open `orchestrator.py`, attach to a cluster, **Run All**. Tail the output; each stage prints `✔` / `❌` per notebook.
@@ -113,6 +115,7 @@ Create one job with three tasks at different cadences, or three separate jobs. E
     },
     {
       "task_key": "knowledge",
+      "_comment": "Enable only after 02_knowledge/01_build_knowledge_index exists.",
       "notebook_task": {"notebook_path": "/Workspace/Repos/<you>/IntelliOps/orchestrator", "base_parameters": {"RUN_OBSERVE": "false", "RUN_KNOWLEDGE": "true", "RUN_REPORT": "false"}},
       "schedule": {"quartz_cron_expression": "0 0 6 ? * SUN", "timezone_id": "UTC"}
     }
@@ -160,14 +163,39 @@ This is useful for ad-hoc debugging (e.g., "rerun the cost trend feature for tod
 
 ## 8. Dashboards
 
-After Report has run at least once, the four Genie dashboards are available:
+> Running the report notebooks **does not create a dashboard by itself** — they only publish stable SQL views (`intelliops.report.*`) that a dashboard binds to. Dashboards are separate workspace objects.
 
-- **Cost Command Center** — monthly spend, top drivers
-- **Cluster Health Map** — utilization heatmap, over-provisioned, idle
-- **Job Reliability** — failure rates, SLA breaches, duration anomalies
-- **Optimization Leaderboard** — agent actions, $ saved, failures prevented
+### 8.1 What the report notebooks do today
 
-Open them under **SQL → Dashboards** in the workspace.
+Each notebook in `07_report/` issues `CREATE OR REPLACE VIEW intelliops.report.<name>` so dashboard tiles have a stable contract. After the scheduled Report stage runs, you get views like:
+
+| Tab | Views |
+|---|---|
+| Cost Command Center | `cost_monthly_summary`, `cost_current_month_trajectory`, `cost_top_drivers_mtd`, `cost_savings_captured`, `cost_by_sku` |
+| Cluster Health Map | `cluster_utilization_heatmap`, `cluster_over_provisioned`, `cluster_idle_summary`, `cluster_size_distribution` |
+| Job Reliability | `job_reliability_overall`, `job_daily_failure_trend`, `job_most_unreliable`, `job_sla_breaches`, `job_duration_anomalies` |
+| Optimization Leaderboard | `agent_activity_mtd`, `agent_monthly_savings_trend`, `agent_recent_actions`, `agent_savings_by_skill` |
+
+### 8.2 Create the dashboard (programmatic)
+
+Run `07_report/00_create_dashboard.py` **once**:
+
+1. Attach to any cluster (DBR 14+).
+2. Fill the three notebook widgets at the top:
+   - `warehouse_id` — SQL Warehouse ID (Workspace → SQL → SQL Warehouses → *Connection details*)
+   - `parent_path` — where to put the dashboard (e.g. `/Workspace/Users/<your-email>`)
+   - `display_name` — defaults to `IntelliOps Cost Observability`
+3. **Run All**. The notebook prints the new dashboard URL.
+
+Open the URL — you'll see one tab per view group with a table tile per view. Customize visualizations (counter / line / bar) in the UI; the dataset bindings are already correct.
+
+### 8.3 Manual fallback
+
+If the programmatic notebook fails (Lakeview specs are sensitive):
+
+1. **Dashboards → Create dashboard** in the workspace.
+2. For each view, add a dataset: `SELECT * FROM intelliops.report.<view>`.
+3. Drop a table tile onto the canvas, point it at the dataset, repeat.
 
 ---
 

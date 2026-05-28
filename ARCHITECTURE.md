@@ -132,8 +132,12 @@ Two Delta tables:
 ### `06_interface/` — Entry Points
 Where users actually interact. Initial target: Databricks App + Slack slash command. Both call the same agent endpoint.
 
-### `07_report/` — Dashboards
-Genie dashboards for the always-on glanceable view: Cost Command Center, Cluster Health Map, Job Reliability, Optimization Leaderboard. Driven by feature tables and `agent_action_log`.
+### `07_report/` — Dashboard View Layer
+The four report notebooks publish **stable SQL views** into `intelliops.report.*` (e.g. `cost_monthly_summary`, `cluster_over_provisioned`). They do **not** create dashboards — dashboards are a separate workspace artifact bound to these views.
+
+`07_report/00_create_dashboard.py` is a one-shot helper that uses the Databricks SDK to create a Lakeview (AI/BI) dashboard with one tab per view group. Run it once; thereafter the dashboard auto-refreshes against the views as the scheduled Report stage updates them.
+
+Always-on dashboard tabs: Cost Command Center, Cluster Health Map, Job Reliability, Optimization Leaderboard.
 
 ### `08_eval/` — Evaluation
 Golden set of ~50 cost questions with expected answer shape and required tool calls. Run on each agent prompt change. Without this, agent quality is unmeasurable.
@@ -148,6 +152,7 @@ Runs Observe (15-min) and Knowledge/Report (daily). **Does not invoke the agent*
 | Drop the Predict module | Out of scope for a support agent; LLMs are weak at numeric forecasting and we don't need scheduled predictions. Forecasting is replaced by simple linear projection inside the `budget_forecast` tool. |
 | System tables + Delta features only | Portable across workspaces; no agent install. |
 | Feature tables are a **cache**, not a moat | `system.*` is the source of truth. Features exist to amortize the DBU→USD join + windowed aggregations, and to give dashboards low-latency reads. Drop a feature table when nothing queries it. |
+| Report notebooks publish **stable views**, not inline output | Dashboards bind to `intelliops.report.<name>`. Notebook logic can change without breaking tiles, as long as the view name + columns stay compatible. |
 | Agent has both `query_features` and `query_system_tables` | Fast path for the 80% case; escape hatch for freshness or long-tail aggregations. Without the escape hatch, staleness would force feature-table churn. |
 | Knowledge layer with RAG | Agent can cite pricing docs and runbooks, not just hallucinate. |
 | Single agent orchestrator | Simpler routing; split later only if eval demands it. |
