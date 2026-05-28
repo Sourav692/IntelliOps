@@ -1,18 +1,21 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # IntelliOps V1 — Orchestrator
+# MAGIC # IntelliOps V2 — Orchestrator
 # MAGIC
-# MAGIC Main entry point that runs the full **OBSERVE → PREDICT → ACT → REPORT** loop.
-# MAGIC
-# MAGIC Schedule this notebook as a Databricks Job (recommended: every 15–60 minutes for
-# MAGIC Observe/Act, daily for Predict/Report).
+# MAGIC Runs the **scheduled** work only. The support agent itself is event-driven
+# MAGIC (Slack / Databricks App) and is **not** invoked from this notebook.
 # MAGIC
 # MAGIC ```
-# MAGIC ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-# MAGIC │ OBSERVE  │ →  │ PREDICT  │ →  │   ACT    │ →  │  REPORT  │
-# MAGIC │ Features │    │ ML Models│    │ 5 Skills │    │ Dashboard│
-# MAGIC └──────────┘    └──────────┘    └──────────┘    └──────────┘
+# MAGIC ┌──────────┐    ┌────────────┐    ┌──────────┐
+# MAGIC │ OBSERVE  │ →  │ KNOWLEDGE  │ →  │  REPORT  │
+# MAGIC │ Features │    │ RAG index  │    │ Dashboard│
+# MAGIC └──────────┘    └────────────┘    └──────────┘
 # MAGIC ```
+# MAGIC
+# MAGIC Recommended cadence:
+# MAGIC - Observe   : every 15 min
+# MAGIC - Knowledge : weekly
+# MAGIC - Report    : daily
 
 # COMMAND ----------
 
@@ -25,19 +28,13 @@ from datetime import datetime
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Configuration — Select Modules to Run
+# MAGIC ## Configuration — Select Stages to Run
 
 # COMMAND ----------
 
-# Toggle individual modules (useful for partial runs / debugging)
 RUN_OBSERVE = True
-RUN_PREDICT = True
-RUN_ACT = True
+RUN_KNOWLEDGE = False   # Toggle True on the weekly run
 RUN_REPORT = True
-
-# Predict models are expensive — run less frequently (e.g., daily)
-# Set to False for frequent (15-min) runs
-RUN_PREDICT_TRAINING = False  # Set True for daily model retraining runs
 
 # COMMAND ----------
 
@@ -50,7 +47,7 @@ results = {}
 start_time = datetime.now()
 
 print(f"{'='*60}")
-print(f" IntelliOps V1 — Pipeline Start: {start_time}")
+print(f" IntelliOps V2 — Pipeline Start: {start_time}")
 print(f"{'='*60}")
 
 # COMMAND ----------
@@ -63,29 +60,20 @@ print(f"{'='*60}")
 if RUN_OBSERVE:
     print("\n▶ Stage 1: OBSERVE — Refreshing feature store...")
 
-    try:
-        dbutils.notebook.run("./01_observe/01_feat_cluster_utilization", timeout_seconds=600)
-        results["feat_cluster_utilization"] = "OK"
-        print("  ✔ feat_cluster_utilization")
-    except Exception as e:
-        results["feat_cluster_utilization"] = f"FAILED: {e}"
-        print(f"  ❌ feat_cluster_utilization: {e}")
+    observe_notebooks = [
+        "01_feat_cluster_utilization",
+        "02_feat_job_cost_trend",
+        "03_feat_job_health",
+    ]
 
-    try:
-        dbutils.notebook.run("./01_observe/02_feat_job_cost_trend", timeout_seconds=600)
-        results["feat_job_cost_trend"] = "OK"
-        print("  ✔ feat_job_cost_trend")
-    except Exception as e:
-        results["feat_job_cost_trend"] = f"FAILED: {e}"
-        print(f"  ❌ feat_job_cost_trend: {e}")
-
-    try:
-        dbutils.notebook.run("./01_observe/03_feat_job_health", timeout_seconds=600)
-        results["feat_job_health"] = "OK"
-        print("  ✔ feat_job_health")
-    except Exception as e:
-        results["feat_job_health"] = f"FAILED: {e}"
-        print(f"  ❌ feat_job_health: {e}")
+    for nb in observe_notebooks:
+        try:
+            dbutils.notebook.run(f"./01_observe/{nb}", timeout_seconds=600)
+            results[nb] = "OK"
+            print(f"  ✔ {nb}")
+        except Exception as e:
+            results[nb] = f"FAILED: {e}"
+            print(f"  ❌ {nb}: {e}")
 
     print("  Stage 1 complete.")
 else:
@@ -94,95 +82,55 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Stage 2: PREDICT — Train/Refresh ML Models
+# MAGIC ### Stage 2: KNOWLEDGE — Refresh RAG Index
 
 # COMMAND ----------
 
-if RUN_PREDICT and RUN_PREDICT_TRAINING:
-    print("\n▶ Stage 2: PREDICT — Training ML models...")
-
+if RUN_KNOWLEDGE:
+    print("\n▶ Stage 2: KNOWLEDGE — Rebuilding RAG index...")
+    # Placeholder until 02_knowledge is implemented.
+    # Expected entry point: ./02_knowledge/01_build_knowledge_index
     try:
-        dbutils.notebook.run("./02_predict/01_cost_spike_predictor", timeout_seconds=1800)
-        results["cost_spike_predictor"] = "OK"
-        print("  ✔ cost_spike_predictor")
+        dbutils.notebook.run("./02_knowledge/01_build_knowledge_index", timeout_seconds=1800)
+        results["knowledge_index"] = "OK"
+        print("  ✔ knowledge_index")
     except Exception as e:
-        results["cost_spike_predictor"] = f"FAILED: {e}"
-        print(f"  ❌ cost_spike_predictor: {e}")
-
-    try:
-        dbutils.notebook.run("./02_predict/02_job_failure_predictor", timeout_seconds=1200)
-        results["job_failure_predictor"] = "OK"
-        print("  ✔ job_failure_predictor")
-    except Exception as e:
-        results["job_failure_predictor"] = f"FAILED: {e}"
-        print(f"  ❌ job_failure_predictor: {e}")
+        results["knowledge_index"] = f"FAILED: {e}"
+        print(f"  ❌ knowledge_index: {e}")
 
     print("  Stage 2 complete.")
-elif RUN_PREDICT:
-    print("\n⏭ Stage 2: PREDICT — Skipped (RUN_PREDICT_TRAINING=False, using existing models)")
 else:
-    print("\n⏭ Stage 2: PREDICT — Skipped")
+    print("\n⏭ Stage 2: KNOWLEDGE — Skipped")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Stage 3: ACT — Execute Agent Skills
-
-# COMMAND ----------
-
-if RUN_ACT:
-    print("\n▶ Stage 3: ACT — Running agent skills...")
-
-    skills = [
-        ("01_cost_spike_alert", 300),
-        ("02_cluster_right_sizing", 300),
-        ("03_job_failure_scorer", 300),
-        ("04_wasteful_compute_detector", 300),
-        ("05_budget_forecast", 300),
-    ]
-
-    for skill_name, timeout in skills:
-        try:
-            dbutils.notebook.run(f"./03_act/{skill_name}", timeout_seconds=timeout)
-            results[skill_name] = "OK"
-            print(f"  ✔ {skill_name}")
-        except Exception as e:
-            results[skill_name] = f"FAILED: {e}"
-            print(f"  ❌ {skill_name}: {e}")
-
-    print("  Stage 3 complete.")
-else:
-    print("\n⏭ Stage 3: ACT — Skipped")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Stage 4: REPORT — Refresh Dashboards
+# MAGIC ### Stage 3: REPORT — Refresh Dashboards
 
 # COMMAND ----------
 
 if RUN_REPORT:
-    print("\n▶ Stage 4: REPORT — Refreshing dashboards...")
+    print("\n▶ Stage 3: REPORT — Refreshing dashboards...")
 
     reports = [
-        ("01_cost_command_center", 300),
-        ("02_cluster_health_map", 300),
-        ("03_job_reliability", 300),
-        ("04_optimization_leaderboard", 300),
+        "01_cost_command_center",
+        "02_cluster_health_map",
+        "03_job_reliability",
+        "04_optimization_leaderboard",
     ]
 
-    for report_name, timeout in reports:
+    for report_name in reports:
         try:
-            dbutils.notebook.run(f"./04_report/{report_name}", timeout_seconds=timeout)
+            dbutils.notebook.run(f"./07_report/{report_name}", timeout_seconds=300)
             results[report_name] = "OK"
             print(f"  ✔ {report_name}")
         except Exception as e:
             results[report_name] = f"FAILED: {e}"
             print(f"  ❌ {report_name}: {e}")
 
-    print("  Stage 4 complete.")
+    print("  Stage 3 complete.")
 else:
-    print("\n⏭ Stage 4: REPORT — Skipped")
+    print("\n⏭ Stage 3: REPORT — Skipped")
 
 # COMMAND ----------
 
@@ -197,7 +145,7 @@ passed = sum(1 for v in results.values() if v == "OK")
 failed = sum(1 for v in results.values() if v != "OK")
 
 print(f"\n{'='*60}")
-print(f" IntelliOps V1 — Pipeline Complete")
+print(f" IntelliOps V2 — Pipeline Complete")
 print(f"{'='*60}")
 print(f"  Duration:  {duration:.0f}s ({duration/60:.1f} min)")
 print(f"  Passed:    {passed}/{len(results)}")
@@ -210,5 +158,6 @@ if failed > 0:
         if status != "OK":
             print(f"  ❌ {step}: {status}")
 
-print(f"\nNext run: configure as Databricks Job with {FEATURE_REFRESH_INTERVAL_MINUTES}-min schedule")
+print(f"\nNote: the support agent (03_agent) is event-driven via 06_interface")
+print(f"      and is intentionally not invoked from the orchestrator.")
 print(f"{'='*60}")
