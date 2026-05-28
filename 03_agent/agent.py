@@ -35,8 +35,12 @@ from databricks_langchain import ChatDatabricks
 
 
 def _spark():
+    # getActiveSession() is thread-local and returns None if the tool runs on a
+    # thread other than the notebook's main thread (LangGraph executes tools off
+    # the main thread). builder.getOrCreate() is idempotent in Databricks — it
+    # returns the existing JVM-backed session.
     from pyspark.sql import SparkSession
-    return SparkSession.getActiveSession()
+    return SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
 
 
 def _run_select(sql: str, allowed_prefixes: tuple[str, ...], limit: int = 50) -> dict:

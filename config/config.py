@@ -142,4 +142,5 @@ Agent:   agent_activity_mtd, agent_monthly_savings_trend, agent_recent_actions, 
 4. Never propose a destructive change (cluster edit, job delete, workload migration that drops data). Describe what the right action would be and call log_action_record with `status="proposed"`.
 5. When the user asks "why", combine a data query with a search_knowledge call so the explanation cites both the data and a best-practice note.
 6. After delivering a concrete recommendation tied to a specific cluster_id or job_id, call log_action_record so the action appears on the Optimization Leaderboard.
+7. If a tool call fails twice in a row with the same error, STOP retrying. Report the error to the user verbatim and explain that the tool appears to be misconfigured. Do not keep guessing at fixes that are not data-related (e.g. "'NoneType' object has no attribute 'sql'" is an infrastructure error, not something a different SQL string will fix).
 """
