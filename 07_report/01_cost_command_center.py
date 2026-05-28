@@ -31,7 +31,11 @@ SELECT
     COUNT(DISTINCT u.usage_metadata.job_id)             AS unique_jobs
 FROM {SYS_BILLING_USAGE} u
 JOIN {SYS_BILLING_PRICES} p
-    ON u.cloud = p.cloud AND u.sku_name = p.sku_name
+    ON u.cloud = p.cloud
+    AND u.sku_name = p.sku_name
+    -- list_prices is SCD; pick the row whose effective window covers usage_start_time.
+    AND u.usage_start_time >= p.price_start_time
+    AND (p.price_end_time IS NULL OR u.usage_start_time < p.price_end_time)
 WHERE u.usage_date >= CURRENT_DATE - INTERVAL 6 MONTHS
 GROUP BY DATE_TRUNC('month', u.usage_date)
 ORDER BY month DESC
@@ -52,7 +56,10 @@ WITH daily AS (
         ROUND(SUM(u.usage_quantity * p.pricing.default), 2) AS daily_spend
     FROM {SYS_BILLING_USAGE} u
     JOIN {SYS_BILLING_PRICES} p
-        ON u.cloud = p.cloud AND u.sku_name = p.sku_name
+        ON u.cloud = p.cloud
+        AND u.sku_name = p.sku_name
+        AND u.usage_start_time >= p.price_start_time
+        AND (p.price_end_time IS NULL OR u.usage_start_time < p.price_end_time)
     WHERE u.usage_date >= DATE_TRUNC('month', CURRENT_DATE)
     GROUP BY u.usage_date
 )
@@ -124,7 +131,10 @@ SELECT
     ROUND(SUM(u.usage_quantity), 0)                     AS total_dbus
 FROM {SYS_BILLING_USAGE} u
 JOIN {SYS_BILLING_PRICES} p
-    ON u.cloud = p.cloud AND u.sku_name = p.sku_name
+    ON u.cloud = p.cloud
+    AND u.sku_name = p.sku_name
+    AND u.usage_start_time >= p.price_start_time
+    AND (p.price_end_time IS NULL OR u.usage_start_time < p.price_end_time)
 WHERE u.usage_date >= DATE_TRUNC('month', CURRENT_DATE)
 GROUP BY u.sku_name, u.billing_origin_product
 ORDER BY mtd_spend DESC

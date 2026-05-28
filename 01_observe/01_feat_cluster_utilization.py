@@ -1,9 +1,10 @@
 # Databricks notebook source
+
 # MAGIC %md
 # MAGIC # Module 1: Observe — Cluster Utilization Features
-# MAGIC
+# MAGIC 
 # MAGIC Reads `system.compute.node_timeline` and builds hourly cluster utilization features.
-# MAGIC
+# MAGIC 
 # MAGIC **Source:** `system.compute.node_timeline` (minute-by-minute CPU, memory, disk I/O per node)
 # MAGIC **Target:** `intelliops.feature_store.feat_cluster_utilization`
 
@@ -33,7 +34,8 @@ df_cluster_util = spark.sql(f"""
         MAX(cpu_user_percent)                    AS peak_cpu_pct,
         AVG(mem_used_percent)                    AS avg_mem_pct,
         MAX(mem_used_percent)                    AS peak_mem_pct,
-        COUNT(DISTINCT node_type)                 AS node_type_count
+        COUNT(DISTINCT instance_id)              AS node_count,
+        COUNT(DISTINCT node_type)                AS node_type_count
     FROM {SYS_COMPUTE_NODE_TIMELINE}
     WHERE start_time >= CURRENT_DATE - INTERVAL 30 DAYS
     GROUP BY cluster_id, workspace_id, date_trunc('hour', start_time)
@@ -77,6 +79,7 @@ df_underutilized = spark.sql(f"""
         COUNT(*)                        AS hours_observed,
         ROUND(AVG(avg_cpu_pct), 1)      AS avg_cpu,
         ROUND(AVG(avg_mem_pct), 1)      AS avg_mem,
+        ROUND(AVG(node_count), 1)       AS avg_nodes,
         ROUND(AVG(node_type_count), 1)  AS avg_node_types
     FROM {TABLE_CLUSTER_UTILIZATION}
     WHERE hour_window >= CURRENT_DATE - INTERVAL 7 DAYS

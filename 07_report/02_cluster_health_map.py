@@ -54,7 +54,7 @@ SELECT
         c.max_autoscale_workers              AS max_workers,
         ROUND(AVG(cu.avg_cpu_pct), 1)        AS avg_cpu_7d,
         ROUND(AVG(cu.avg_mem_pct), 1)        AS avg_mem_7d,
-        ROUND(AVG(cu.node_type_count), 1)    AS avg_nodes
+        ROUND(AVG(cu.node_count), 1)         AS avg_nodes
     FROM {TABLE_CLUSTER_UTILIZATION} cu
     LEFT JOIN (
         SELECT *, ROW_NUMBER() OVER (
@@ -85,11 +85,11 @@ SELECT
         workspace_id,
         COUNT(DISTINCT cluster_id)                  AS total_clusters,
         SUM(CASE WHEN avg_cpu_pct < 5
-                 THEN 1 ELSE 0 END)                AS idle_observations,
-        ROUND(AVG(node_type_count), 1)               AS avg_nodes_across_all,
+                 THEN 1 ELSE 0 END)                 AS idle_observations,
+        ROUND(AVG(node_count), 1)                    AS avg_nodes_across_all,
         ROUND(SUM(CASE WHEN avg_cpu_pct < 5
-            THEN node_type_count ELSE 0 END) * 1.0
-            / NULLIF(SUM(node_type_count), 0) * 100, 1)  AS idle_node_pct
+            THEN node_count ELSE 0 END) * 1.0
+            / NULLIF(SUM(node_count), 0) * 100, 1)  AS idle_node_pct
     FROM {TABLE_CLUSTER_UTILIZATION}
     WHERE hour_window >= CURRENT_DATE - INTERVAL 7 DAYS
     GROUP BY workspace_id
@@ -105,6 +105,19 @@ SELECT
 
 spark.sql(f"""
 CREATE OR REPLACE VIEW {REPORT_SCHEMA}.cluster_size_distribution AS
+WITH latest_clusters AS (
+    -- system.compute.clusters is SCD; without this, a cluster that was resized
+    -- (e.g. 10 → 20 workers) appears in multiple buckets.
+    SELECT cluster_id, workspace_id, max_autoscale_workers, delete_time
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY cluster_id, workspace_id ORDER BY change_time DESC
+        ) AS _rn
+        FROM {SYS_COMPUTE_CLUSTERS}
+    )
+    WHERE _rn = 1
+      AND delete_time IS NULL
+)
 SELECT
     CASE
         WHEN max_autoscale_workers <= 2 THEN 'Small (1-2)'
@@ -113,8 +126,7 @@ SELECT
         ELSE 'XLarge (20+)'
     END AS cluster_size_bucket,
     COUNT(DISTINCT cluster_id) AS cluster_count
-FROM system.compute.clusters
-WHERE delete_time IS NULL
+FROM latest_clusters
 GROUP BY ALL
 ORDER BY cluster_count DESC
 """)

@@ -27,53 +27,34 @@ from datetime import datetime
 
 # COMMAND ----------
 
-df_cost_enriched = spark.sql(f"""
-    WITH cost_enriched AS (
-        SELECT
-            u.workspace_id,
-            u.usage_metadata.job_id                     AS job_id,
-            j.name                                      AS job_name,
-            u.usage_date,
-            SUM(u.usage_quantity * p.pricing.default)    AS daily_cost_usd
-        FROM {SYS_BILLING_USAGE} u
-        JOIN {SYS_BILLING_PRICES} p
-            ON u.cloud = p.cloud
-            AND u.sku_name = p.sku_name
-        LEFT JOIN {SYS_LAKEFLOW_JOBS} j
-            ON u.workspace_id = j.workspace_id
-            AND u.usage_metadata.job_id = j.job_id
-        WHERE u.usage_metadata.job_id IS NOT NULL
-          AND u.usage_date >= CURRENT_DATE - INTERVAL 60 DAYS
-        GROUP BY ALL
-    )
-    SELECT *
-    FROM cost_enriched
-    ORDER BY workspace_id, job_id, usage_date
-""")
-
-print(f"Daily cost records: {df_cost_enriched.count()}")
-df_cost_enriched.display()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 2: Add Rolling Averages & Growth Rate
-
-# COMMAND ----------
-
 df_cost_trend = spark.sql(f"""
-    WITH cost_enriched AS (
+    WITH latest_jobs AS (
+        -- system.lakeflow.jobs is SCD-2; keep only the most recent definition
+        -- per (workspace_id, job_id) to prevent cartesian inflation.
+        SELECT workspace_id, job_id, name AS job_name
+        FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY workspace_id, job_id ORDER BY change_time DESC
+            ) AS _rn
+            FROM {SYS_LAKEFLOW_JOBS}
+        ) WHERE _rn = 1
+    ),
+    cost_enriched AS (
+        -- list_prices is also SCD-2; restrict the price join to the row whose
+        -- effective window covers the usage event so USD totals stay correct.
         SELECT
             u.workspace_id,
             u.usage_metadata.job_id                     AS job_id,
-            j.name                                      AS job_name,
+            j.job_name                                  AS job_name,
             u.usage_date,
-            SUM(u.usage_quantity * p.pricing.default)    AS daily_cost_usd
+            SUM(u.usage_quantity * p.pricing.default)   AS daily_cost_usd
         FROM {SYS_BILLING_USAGE} u
         JOIN {SYS_BILLING_PRICES} p
             ON u.cloud = p.cloud
             AND u.sku_name = p.sku_name
-        LEFT JOIN {SYS_LAKEFLOW_JOBS} j
+            AND u.usage_start_time >= p.price_start_time
+            AND (p.price_end_time IS NULL OR u.usage_start_time < p.price_end_time)
+        LEFT JOIN latest_jobs j
             ON u.workspace_id = j.workspace_id
             AND u.usage_metadata.job_id = j.job_id
         WHERE u.usage_metadata.job_id IS NOT NULL
