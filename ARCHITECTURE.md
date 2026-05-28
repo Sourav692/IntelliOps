@@ -82,7 +82,7 @@ IntelliOps/
 └── orchestrator.py                     # Runs scheduled work: Observe, Knowledge, Report
 ```
 
-Modules without files yet are placeholders for the next implementation phase.
+Implementation status: `config/`, `00_setup/`, `01_observe/`, `02_knowledge/`, `03_agent/`, `04_tools/`, `05_memory/`, `07_report/` are populated. `06_interface/` and `08_eval/` are placeholders for the next phase.
 
 ## 4. Module-Wise Responsibilities
 
@@ -107,10 +107,20 @@ Trade-off: features are stale by up to one refresh interval (~15 min). For anyth
 | `03_feat_job_health` | `system.lakeflow.job_run_timeline` | Failure rate, duration stats (30-day) |
 
 ### `02_knowledge/` — Knowledge Base (RAG)
-Indexes Databricks pricing docs, cost best-practices, and internal runbooks into a vector index (Databricks Vector Search). Refreshed weekly. Gives the agent "why" not just "what."
+Two notebooks plus one Python module:
+- `00_seed_knowledge_docs.py` — seeds `intelliops.knowledge.knowledge_docs` (Delta table with Change Data Feed) with curated cost/pricing/runbook snippets.
+- `01_build_knowledge_index.py` — creates the `intelliops_vs_endpoint` Vector Search endpoint and a Delta-sync index (`knowledge_docs_idx`) over the docs table, embedded with `databricks-gte-large-en`.
+- `knowledge.py` — `search_knowledge(query, num_results)` thin wrapper over the index. Falls back gracefully if the index is unreachable.
+
+Refresh: re-run `01_build_knowledge_index` after appending rows to the docs table; the index is `TRIGGERED` (not continuous) to keep cost predictable.
 
 ### `03_agent/` — Support Agent
-The LLM-driven core. Receives a question from the Interface, plans tool calls, reasons over results, writes to Memory, returns an answer. One orchestrator agent (not per-domain) to start; revisit if eval shows degradation.
+The LLM-driven core. Files:
+- `tools.py` — JSON schemas for the LLM (`query_features`, `query_system_tables`, `search_knowledge`, `log_action_record`), pure-function implementations, and a guarded `_run_select` that rejects anything outside the allowed namespaces or that contains mutation keywords.
+- `agent.py` — `ask(question, user_id, session_id)` runs a tool-calling loop against the Foundation Model endpoint via the OpenAI-compatible client. Capped by `AGENT_MAX_ITERATIONS`. Every assistant turn and every tool call is appended to `agent_conversation`.
+- `01_ask_agent.py` — Notebook entry point used until `06_interface/` lands.
+
+Design: one orchestrator agent (not per-domain). The agent never mutates Databricks resources — destructive operations live in `04_tools/` and are triggered only behind the approval gate.
 
 ### `04_tools/` — Tool Layer
 Pure callable functions the agent invokes. Each tool is testable in isolation and uses approved I/O only:
@@ -125,9 +135,12 @@ Pure callable functions the agent invokes. Each tool is testable in isolation an
 - `notify` — Slack/Teams webhook.
 
 ### `05_memory/` — Memory & Audit
-Two Delta tables:
-- `agent_action_log` — every tool call, recommendation, and outcome (powers the Optimization Leaderboard).
-- `agent_conversation` — turn-level history per user/session for follow-up questions.
+- `00_setup_memory.py` — DDL for `intelliops.memory.agent_conversation` (the action log already lives in `intelliops.feature_store.agent_action_log` and is owned by `00_setup`).
+- `memory.py` — `log_turn`, `get_conversation`, `log_action_record`, `get_recent_actions`. All writes are append-only.
+
+Schema split:
+- `agent_conversation` — turn-level history per session (role, content, tool_name, tool_args, tool_result, user_id, ts).
+- `agent_action_log` — recommendations + outcomes, powers the Optimization Leaderboard.
 
 ### `06_interface/` — Entry Points
 Where users actually interact. Initial target: Databricks App + Slack slash command. Both call the same agent endpoint.

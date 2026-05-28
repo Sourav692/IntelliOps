@@ -2,14 +2,14 @@
 
 A **support agent for Databricks cost observability** at the job and cluster level. Answers questions like *"why did cluster X cost $400 yesterday?"* and *"which jobs are wasting the most spend this week?"* — backed by Unity Catalog system tables, pre-aggregated Delta features, and an LLM agent with tool access.
 
-> Architecture and module responsibilities live in [`ARCHITECTURE.md`](./ARCHITECTURE.md). Treat that file as the source of truth; this README only covers **how to run it on Databricks**.
+> Architecture and module responsibilities live in `ARCHITECTURE.md`. Treat that file as the source of truth; this README only covers **how to run it on Databricks**.
 
 ---
 
 ## 1. Prerequisites
 
 | Requirement | Notes |
-|---|---|
+| --- | --- |
 | Databricks workspace | Any cloud (AWS / Azure / GCP). |
 | Unity Catalog | Required — features and memory live in UC. |
 | System tables enabled | `system.billing.*`, `system.compute.*`, `system.lakeflow.*` must be enabled for your metastore. |
@@ -43,7 +43,7 @@ All paths below assume that root.
 
 ## 3. Configure
 
-Open [`config/config.py`](./config/config.py) and update:
+Open `config/config.py` and update:
 
 ```python
 CATALOG = "intelliops"            # change if you want a different UC catalog
@@ -68,9 +68,11 @@ Thresholds (cost spike %, CPU/memory floors, idle hours, budget alert %) are als
 Run `00_setup/00_setup_feature_store.py` **once** to create the Delta tables.
 
 From the workspace UI:
+
 - Open the notebook, attach to a cluster, **Run All**.
 
 From the CLI:
+
 ```bash
 databricks workspace import-dir ./ /Workspace/Repos/<your-email>/IntelliOps --overwrite
 databricks jobs submit --json '{
@@ -88,7 +90,7 @@ This creates: `intelliops.feature_store.{feat_cluster_utilization, feat_job_cost
 
 `orchestrator.py` runs the **scheduled** stages only: **Observe → Knowledge → Report**. The support agent itself is event-driven (see §6) and is *not* invoked here.
 
-> **What runs today:** only Observe and Report. Knowledge is **wired into the orchestrator but its notebook (`02_knowledge/01_build_knowledge_index`) does not exist yet** — that module is a placeholder (see §10). `RUN_KNOWLEDGE` therefore defaults to `False`; flip it to `True` only after the Knowledge module is implemented.
+> **What runs today:** only Observe and Report. Knowledge is **wired into the orchestrator but its notebook (**`02_knowledge/01_build_knowledge_index`**) does not exist yet** — that module is a placeholder (see §10). `RUN_KNOWLEDGE` therefore defaults to `False`; flip it to `True` only after the Knowledge module is implemented.
 
 ### Option A — Manual run (good for first validation)
 
@@ -126,7 +128,7 @@ Create one job with three tasks at different cadences, or three separate jobs. E
 Recommended cadence:
 
 | Stage | Cadence |
-|---|---|
+| --- | --- |
 | Observe | every 15 min |
 | Report | daily |
 | Knowledge | weekly |
@@ -135,17 +137,38 @@ Recommended cadence:
 
 ## 6. The Support Agent
 
-The agent (in `03_agent/`) is **event-driven** — it is invoked when a user asks a question via `06_interface/` (Slack slash command or a Databricks App). It is *not* invoked from `orchestrator.py`.
+The agent (`03_agent/`) is **event-driven** — invoked per question, not from the scheduled orchestrator. It uses the Databricks Foundation Model API (`LLM_ENDPOINT_NAME` in config) and the OpenAI-compatible client.
 
-> `02_knowledge/`, `03_agent/`, `05_memory/`, `06_interface/`, and `08_eval/` are placeholders in the current commit. See `ARCHITECTURE.md` §4 for what each module will own when implemented.
+### 6.1 One-time setup (in addition to §4)
 
-Once implemented, the typical flow will be:
+```text
+Run:
+  02_knowledge/00_seed_knowledge_docs       # populates the curated corpus
+  02_knowledge/01_build_knowledge_index     # creates the Vector Search endpoint + index
+  05_memory/00_setup_memory                 # creates agent_conversation table
+```
 
-1. User runs `/intelliops why did <cluster> cost $X yesterday?` in Slack.
-2. `06_interface/` forwards to the agent endpoint.
-3. `03_agent/` plans, calls tools in `04_tools/`, optionally consults the RAG index in `02_knowledge/`.
-4. Answer returned to the user; tool calls and outcomes logged to `05_memory/agent_action_log`.
-5. Any cluster mutation is gated by `REQUIRE_APPROVAL_FOR_CLUSTER_EDIT`.
+### 6.2 Ask the agent
+
+Open `03_agent/01_ask_agent.py`, set the `question` widget, **Run All**. The notebook prints:
+
+- The agent's answer
+- The session ID
+- Every tool call made (`query_features`, `query_system_tables`, `search_knowledge`, `log_action_record`)
+- A replay of the full conversation from `intelliops.memory.agent_conversation`
+
+### 6.3 What the agent can do today
+
+- Query feature tables and report views (fast path)
+- Query `system.*` directly (escape hatch for fresh / un-aggregated data)
+- Retrieve from the curated knowledge corpus (RAG)
+- Log recommendations into `agent_action_log` so they appear on the Optimization Leaderboard
+
+### 6.4 What it deliberately cannot do today
+
+- Mutate clusters or jobs. The agent never calls the Clusters/Jobs REST API. Mutations remain in `04_tools/02_cluster_right_sizing.py`, gated by `REQUIRE_APPROVAL_FOR_CLUSTER_EDIT`, and triggered manually until `06_interface/` ships with an approval flow.
+
+> Still placeholders: `06_interface/` (Slack / Databricks App front-end) and `08_eval/` (golden question set for offline scoring). See §10.
 
 ---
 
@@ -170,7 +193,7 @@ This is useful for ad-hoc debugging (e.g., "rerun the cost trend feature for tod
 Each notebook in `07_report/` issues `CREATE OR REPLACE VIEW intelliops.report.<name>` so dashboard tiles have a stable contract. After the scheduled Report stage runs, you get views like:
 
 | Tab | Views |
-|---|---|
+| --- | --- |
 | Cost Command Center | `cost_monthly_summary`, `cost_current_month_trajectory`, `cost_top_drivers_mtd`, `cost_savings_captured`, `cost_by_sku` |
 | Cluster Health Map | `cluster_utilization_heatmap`, `cluster_over_provisioned`, `cluster_idle_summary`, `cluster_size_distribution` |
 | Job Reliability | `job_reliability_overall`, `job_daily_failure_trend`, `job_most_unreliable`, `job_sla_breaches`, `job_duration_anomalies` |
@@ -201,24 +224,22 @@ If the programmatic notebook fails (Lakeview specs are sensitive):
 
 ## 9. Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `Table or view not found: system.billing.usage` | System tables not enabled | Run the `ALTER METASTORE` SQL in §1. |
-| `Permission denied` writing to `intelliops.*` | Missing UC privileges | Grant `USE CATALOG`, `CREATE SCHEMA`, `MODIFY` on the target catalog. |
-| Observe finishes but dashboards are empty | Report stage didn't run | Run `orchestrator.py` with `RUN_REPORT=True`. |
-| Agent right-sizing call fails | `REQUIRE_APPROVAL_FOR_CLUSTER_EDIT=True` blocks mutation | Expected — approve via the interface, or set to `False` only in a dev workspace. |
-| Notebook can't import `04_tools/databricks_api` as a module | Notebooks aren't on `sys.path` by default | Use `%run ./04_tools/databricks_api` from another notebook, or wrap as a wheel in a future iteration. |
+| Symptom | Likely cause | Fix |  |
+| --- | --- | --- | --- |
+| `Table or view not found: system.billing.usage` | System tables not enabled | Run the `ALTER METASTORE` SQL in §1. |  |
+| `Permission denied` writing to `intelliops.*` | Missing UC privileges | Grant `USE CATALOG`, `CREATE SCHEMA`, `MODIFY` on the target catalog. |  |
+| Observe finishes but dashboards are empty | Report stage didn't run | Run `orchestrator.py` with `RUN_REPORT=True`. |  |
+| Agent right-sizing call fails | `REQUIRE_APPROVAL_FOR_CLUSTER_EDIT=True` blocks mutation | Expected — approve via the interface, or set to `False` only in a dev workspace. |  |
+| Notebook can't import `04_tools/databricks_api` as a module | Notebooks aren't on `sys.path` by default | Use `%run ./04_tools/databricks_api` from another notebook, or wrap as a wheel in a future iteration. |  |
 
 ---
 
 ## 10. What's Next
 
-The current commit has the scheduled side (Observe / Report) working end-to-end and the tool implementations in `04_tools/`. The next implementation milestones:
+The current commit has the scheduled side (Observe / Report), the tool implementations in `04_tools/`, **and** a first cut of `02_knowledge/`, `03_agent/`, and `05_memory/` working end-to-end. Remaining milestones:
 
-1. **`02_knowledge/`** — Vector Search index over Databricks pricing docs + internal runbooks.
-2. **`03_agent/`** — LLM orchestrator wiring tools + knowledge + memory.
-3. **`05_memory/`** — Delta-backed conversation history + extended action log.
-4. **`06_interface/`** — Slack slash command and a Databricks App front-end.
-5. **`08_eval/`** — Golden question set for offline agent scoring.
+1. `06_interface/` — Slack slash command and a Databricks App front-end so users don't have to open a notebook to ask the agent.
+2. `08_eval/` — Golden question set + offline scoring so prompt/model changes don't silently regress.
+3. **Agent-side cluster mutation flow** — wire the right-sizing tool into the agent behind a human-approval prompt (currently the agent can only describe the change, not propose+apply through the same UI).
 
-Refer to [`ARCHITECTURE.md`](./ARCHITECTURE.md) §7 (rules) before adding new modules or data sources.
+Refer to `ARCHITECTURE.md` §7 (rules) before adding new modules or data sources.

@@ -19,6 +19,17 @@ TABLE_AGENT_ACTIONS = f"{FULL_SCHEMA}.agent_action_log"
 # Report layer — stable SQL views that dashboards bind to
 REPORT_SCHEMA = f"{CATALOG}.report"
 
+# Memory layer — conversation history + action log
+MEMORY_SCHEMA = f"{CATALOG}.memory"
+TABLE_CONVERSATION = f"{MEMORY_SCHEMA}.agent_conversation"
+
+# Knowledge layer — RAG corpus + Vector Search index
+KNOWLEDGE_SCHEMA = f"{CATALOG}.knowledge"
+TABLE_KNOWLEDGE_DOCS = f"{KNOWLEDGE_SCHEMA}.knowledge_docs"
+VS_ENDPOINT_NAME = "intelliops_vs_endpoint"
+VS_INDEX_NAME = f"{KNOWLEDGE_SCHEMA}.knowledge_docs_idx"
+EMBEDDING_MODEL_ENDPOINT = "databricks-gte-large-en"  # Databricks-hosted embedding model
+
 # ── System Tables ───────────────────────────────────────────────────────────────
 SYS_BILLING_USAGE = "system.billing.usage"
 SYS_BILLING_PRICES = "system.billing.list_prices"
@@ -83,7 +94,26 @@ REQUIRE_APPROVAL_FOR_CLUSTER_EDIT = True
 
 # COMMAND ----------
 
-# ── MLflow Settings ─────────────────────────────────────────────────────────────
-MLFLOW_EXPERIMENT_PREFIX = "/IntelliOps"
-COST_MODEL_NAME = f"{CATALOG}.models.cost_spike_predictor"
-FAILURE_MODEL_NAME = f"{CATALOG}.models.job_failure_predictor"
+# ── Agent (LLM) Settings ────────────────────────────────────────────────────────
+# Databricks Foundation Model API endpoint. Override with any pay-per-token or
+# provisioned-throughput endpoint your workspace has access to.
+LLM_ENDPOINT_NAME = "databricks-meta-llama-3-3-70b-instruct"
+AGENT_MAX_ITERATIONS = 6        # Tool-call loop safety cap
+AGENT_TEMPERATURE = 0.1
+AGENT_MAX_TOKENS = 1500
+
+AGENT_SYSTEM_PROMPT = (
+    "You are IntelliOps, a Databricks cost-observability support agent. "
+    "You answer questions about cluster utilization, job cost, waste, and budgets "
+    "for Databricks workspaces. "
+    "Prefer pre-aggregated feature tables (fast path) via query_features; fall back "
+    "to query_system_tables only when the requested data is not pre-aggregated or "
+    "freshness within the last ~15 minutes is required. "
+    "When the user asks 'why' or wants best practices, use search_knowledge to ground "
+    "your answer in IntelliOps's curated docs. "
+    "Always cite the underlying tables/views or knowledge sources you used. "
+    "Never propose a destructive change (cluster edit, job delete) — only describe what "
+    "the right action would be. "
+    "When you finish a useful action, call log_action_record so it appears on the "
+    "Optimization Leaderboard."
+)
