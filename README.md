@@ -137,7 +137,7 @@ Recommended cadence:
 
 ## 6. The Support Agent
 
-The agent (`03_agent/`) is **event-driven** — invoked per question, not from the scheduled orchestrator. It is built on **LangGraph** (`StateGraph` with `llm` and `tools` nodes), uses **`ChatDatabricks`** from `databricks-langchain` to call the Databricks Foundation Model endpoint (`LLM_ENDPOINT_NAME` in config), and bounds the tool-call loop at `AGENT_MAX_ITERATIONS`.
+The agent (`03_agent/`) is **event-driven** — invoked per question, not from the scheduled orchestrator. It's a single-file LangGraph ReAct agent built with `create_react_agent`, using `ChatDatabricks` (from `databricks-langchain`) against the Foundation Model endpoint named in `LLM_ENDPOINT_NAME`. Tools are closures over config — no globals, no module-loader gymnastics.
 
 ### 6.1 One-time setup (in addition to §4)
 

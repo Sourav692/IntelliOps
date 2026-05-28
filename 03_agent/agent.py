@@ -1,109 +1,120 @@
-"""IntelliOps support agent — LangGraph implementation.
+"""IntelliOps support agent — minimal LangGraph implementation.
 
-State machine:
+One file. Tools are defined inline inside `build_graph(...)` so they close over
+the config the caller passes in (no global injection, no dynamic module loaders).
+Returns a compiled LangGraph graph the caller invokes directly.
 
-    ┌──────────┐         tool_calls          ┌──────────┐
-    │   llm    │ ─────────────────────────►  │  tools   │
-    │  (node)  │ ◄─────────────────────────  │  (node)  │
-    └──────────┘         tool results        └──────────┘
-         │
-         │ no tool_calls
-         ▼
-        END
+Usage from a Databricks notebook (after `%run ../config/config`):
 
-Each `llm` invocation increments an iteration counter and bails out at
-`AGENT_MAX_ITERATIONS`. Every assistant turn and every tool call is appended to
-`intelliops.memory.agent_conversation` for auditability.
+    from agent import build_graph
 
-Expected globals from `%run ../config/config`:
-  LLM_ENDPOINT_NAME, AGENT_MAX_ITERATIONS, AGENT_TEMPERATURE, AGENT_MAX_TOKENS,
-  AGENT_SYSTEM_PROMPT, TABLE_CONVERSATION, TABLE_AGENT_ACTIONS,
-  VS_ENDPOINT_NAME, VS_INDEX_NAME.
+    graph = build_graph(
+        llm_endpoint=LLM_ENDPOINT_NAME,
+        system_prompt=AGENT_SYSTEM_PROMPT,
+        vs_endpoint=VS_ENDPOINT_NAME,
+        vs_index=VS_INDEX_NAME,
+        table_actions=TABLE_AGENT_ACTIONS,
+    )
+
+    result = graph.invoke({"messages": [("user", "Why is cluster X expensive?")]})
+    print(result["messages"][-1].content)
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import os
-import sys
 import uuid
-from typing import Annotated, Sequence, TypedDict
+from datetime import datetime, timezone
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
 from langchain_core.tools import tool
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
+from langgraph.prebuilt import create_react_agent
 from databricks_langchain import ChatDatabricks
 
 
-# ── Module loaders ────────────────────────────────────────────────────────────
-# tools.py and 05_memory/memory.py rely on config constants being present in
-# their module globals (Databricks `%run` pattern). We re-create that by loading
-# them as files and injecting the constants this module already has.
+# ── SQL guard (shared by the two query tools) ────────────────────────────────
 
 
-def _load_module(path: str, alias: str, injected_globals: dict) -> object:
-    spec = importlib.util.spec_from_file_location(alias, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load module from {path}")
-    mod = importlib.util.module_from_spec(spec)
-    for k, v in injected_globals.items():
-        setattr(mod, k, v)
-    sys.modules[alias] = mod
-    spec.loader.exec_module(mod)
-    return mod
+def _spark():
+    from pyspark.sql import SparkSession
+    return SparkSession.getActiveSession()
 
 
-def _here() -> str:
-    return os.path.dirname(__file__)
+def _run_select(sql: str, allowed_prefixes: tuple[str, ...], limit: int = 50) -> dict:
+    """Refuses anything that isn't a single SELECT/WITH or that touches a namespace
+    outside `allowed_prefixes`."""
+    s = sql.strip().rstrip(";").strip()
+    head = s.lstrip("(").lstrip().lower()
+    if not (head.startswith("select") or head.startswith("with ")):
+        return {"error": "Only SELECT / WITH queries are allowed."}
+    lower = s.lower()
+    if not any(p in lower for p in allowed_prefixes):
+        return {"error": f"Query must read from one of: {allowed_prefixes}"}
+    for bad in ("insert ", "update ", "delete ", "drop ", "alter ", "merge ", "create "):
+        if bad in lower:
+            return {"error": f"Disallowed keyword: {bad.strip()}"}
+    if " limit " not in lower:
+        s = f"SELECT * FROM ({s}) _q LIMIT {limit}"
+    try:
+        rows = _spark().sql(s).collect()
+        return {"row_count": len(rows), "rows": [r.asDict() for r in rows[:limit]]}
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def _injected() -> dict:
-    return {
-        k: globals()[k]
-        for k in (
-            "TABLE_AGENT_ACTIONS",
-            "TABLE_CONVERSATION",
-            "VS_ENDPOINT_NAME",
-            "VS_INDEX_NAME",
-        )
-        if k in globals()
-    }
+# ── Graph factory ────────────────────────────────────────────────────────────
 
 
-# ── Tool wrappers ────────────────────────────────────────────────────────────
+def build_graph(
+    llm_endpoint: str,
+    system_prompt: str,
+    vs_endpoint: str | None = None,
+    vs_index: str | None = None,
+    table_actions: str | None = None,
+    temperature: float = 0.1,
+    max_tokens: int = 1500,
+):
+    """Build a LangGraph ReAct agent over the four IntelliOps tools.
 
-
-def _build_tools():
-    tools_mod = _load_module(os.path.join(_here(), "tools.py"), "ops_agent_tools", _injected())
+    Knowledge search and action logging are no-ops if their config is not passed,
+    so the agent still works in a minimal setup.
+    """
 
     @tool
     def query_features(sql: str) -> dict:
-        """Fast path. Run a read-only SELECT against the pre-aggregated IntelliOps
-        feature tables (intelliops.feature_store.*) or the stable report views
-        (intelliops.report.*). Use this for the common case."""
-        return tools_mod.query_features(sql)
+        """Fast path. Read-only SELECT against intelliops.feature_store.* or
+        intelliops.report.*. Use for the common questions."""
+        return _run_select(
+            sql, ("intelliops.feature_store.", "intelliops.report.")
+        )
 
     @tool
     def query_system_tables(sql: str) -> dict:
         """Escape hatch. Read-only SELECT against system.billing.*, system.compute.*,
-        or system.lakeflow.*. Use only when the data is not pre-aggregated or when
-        freshness within the last ~15 minutes is required."""
-        return tools_mod.query_system_tables(sql)
+        or system.lakeflow.*. Use only when the data is not pre-aggregated or
+        sub-15-minute freshness is required."""
+        return _run_select(
+            sql, ("system.billing.", "system.compute.", "system.lakeflow.")
+        )
 
     @tool
     def search_knowledge(query: str, num_results: int = 4) -> dict:
         """Semantic search over IntelliOps's curated knowledge corpus (pricing
-        notes, cost-optimization best practices, internal runbooks). Use when the
-        user asks 'why' / 'best practice' / 'how should I'."""
-        return tools_mod.search_knowledge(query, num_results)
+        notes, cost-optimization best practices, internal runbooks)."""
+        if not vs_endpoint or not vs_index:
+            return {"error": "knowledge index not configured"}
+        try:
+            from databricks.vector_search.client import VectorSearchClient
+            vsc = VectorSearchClient(disable_notice=True)
+            resp = vsc.get_index(vs_endpoint, vs_index).similarity_search(
+                query_text=query,
+                columns=["doc_id", "title", "content", "source", "tags"],
+                num_results=int(num_results),
+            )
+            cols = [c["name"] for c in resp.get("manifest", {}).get("columns", [])]
+            data = resp.get("result", {}).get("data_array", []) or []
+            return {"results": [dict(zip(cols, row)) for row in data]}
+        except Exception as e:
+            return {"error": str(e)}
 
     @tool
     def log_action_record(
@@ -114,183 +125,43 @@ def _build_tools():
         description: str,
         projected_savings: float = 0.0,
         status: str = "proposed",
-        workspace_id: str | None = None,
+        workspace_id: str = "",
     ) -> dict:
         """Persist a recommendation to the agent action log so it appears on the
-        Optimization Leaderboard. Call when you have delivered a concrete
-        recommendation tied to a specific Databricks resource."""
-        return tools_mod.log_action_record(
-            skill_name=skill_name,
-            action_type=action_type,
-            target_id=target_id,
-            target_name=target_name,
-            description=description,
-            projected_savings=projected_savings,
-            status=status,
-            workspace_id=workspace_id,
+        Optimization Leaderboard."""
+        if not table_actions:
+            return {"error": "action log not configured"}
+        action_id = str(uuid.uuid4())
+        df = _spark().createDataFrame(
+            [(
+                action_id,
+                datetime.now(timezone.utc),
+                skill_name,
+                action_type,
+                workspace_id or None,
+                target_id,
+                target_name,
+                description,
+                float(projected_savings or 0.0),
+                status,
+                json.dumps({}),
+            )],
+            "action_id string, action_timestamp timestamp, skill_name string, "
+            "action_type string, workspace_id string, target_id string, "
+            "target_name string, description string, projected_savings double, "
+            "status string, details string",
         )
-
-    return [query_features, query_system_tables, search_knowledge, log_action_record]
-
-
-# ── State ────────────────────────────────────────────────────────────────────
-
-
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-    session_id: str
-    user_id: str | None
-    iteration: int
-    tool_calls_made: list[dict]
-
-
-# ── Graph build (lazy, cached) ───────────────────────────────────────────────
-
-_graph = None
-_memory = None
-
-
-def _get_memory():
-    global _memory
-    if _memory is None:
-        _memory = _load_module(
-            os.path.join(_here(), "..", "05_memory", "memory.py"),
-            "ops_agent_memory",
-            _injected(),
-        )
-    return _memory
-
-
-def _build_graph():
-    tools_list = _build_tools()
-    tools_by_name = {t.name: t for t in tools_list}
+        df.write.mode("append").saveAsTable(table_actions)
+        return {"action_id": action_id, "status": status}
 
     llm = ChatDatabricks(
-        endpoint=LLM_ENDPOINT_NAME,            # noqa: F821
-        temperature=AGENT_TEMPERATURE,          # noqa: F821
-        max_tokens=AGENT_MAX_TOKENS,            # noqa: F821
-    ).bind_tools(tools_list)
-
-    def llm_node(state: AgentState) -> dict:
-        if state["iteration"] >= AGENT_MAX_ITERATIONS:  # noqa: F821
-            stop_msg = AIMessage(
-                content="Stopped — reached the tool-call iteration cap."
-            )
-            return {"messages": [stop_msg]}
-
-        response = llm.invoke(state["messages"])
-        _get_memory().log_turn(
-            state["session_id"],
-            "assistant",
-            response.content or "",
-            user_id=state.get("user_id"),
-        )
-        return {"messages": [response], "iteration": state["iteration"] + 1}
-
-    def tools_node(state: AgentState) -> dict:
-        last = state["messages"][-1]
-        if not isinstance(last, AIMessage) or not last.tool_calls:
-            return {}
-
-        memory = _get_memory()
-        outputs: list[ToolMessage] = []
-        records: list[dict] = []
-
-        for tc in last.tool_calls:
-            name = tc["name"]
-            args = tc.get("args") or {}
-            fn = tools_by_name.get(name)
-            if fn is None:
-                result = {"error": f"unknown tool '{name}'"}
-            else:
-                try:
-                    result = fn.invoke(args)
-                except Exception as e:
-                    result = {"error": str(e)}
-
-            outputs.append(
-                ToolMessage(
-                    content=json.dumps(result, default=str)[:8000],
-                    name=name,
-                    tool_call_id=tc["id"],
-                )
-            )
-            records.append({"name": name, "args": json.dumps(args), "result": result})
-
-            memory.log_turn(
-                state["session_id"],
-                "tool",
-                content="",
-                tool_name=name,
-                tool_args=args,
-                tool_result=result,
-                user_id=state.get("user_id"),
-            )
-
-        return {
-            "messages": outputs,
-            "tool_calls_made": state.get("tool_calls_made", []) + records,
-        }
-
-    def should_continue(state: AgentState) -> str:
-        last = state["messages"][-1]
-        if isinstance(last, AIMessage) and last.tool_calls:
-            return "tools"
-        return END
-
-    graph = StateGraph(AgentState)
-    graph.add_node("llm", llm_node)
-    graph.add_node("tools", tools_node)
-    graph.add_edge(START, "llm")
-    graph.add_conditional_edges("llm", should_continue, {"tools": "tools", END: END})
-    graph.add_edge("tools", "llm")
-    return graph.compile()
-
-
-# ── Public API (unchanged signature) ─────────────────────────────────────────
-
-
-def ask(
-    question: str,
-    user_id: str | None = None,
-    session_id: str | None = None,
-) -> dict:
-    """Run one user question through the LangGraph agent.
-
-    Returns: {session_id, answer, tool_calls, iterations}.
-    """
-    global _graph
-    if _graph is None:
-        _graph = _build_graph()
-
-    memory = _get_memory()
-    session_id = session_id or str(uuid.uuid4())
-    memory.log_turn(session_id, "user", question, user_id=user_id)
-
-    initial: AgentState = {
-        "messages": [
-            SystemMessage(content=AGENT_SYSTEM_PROMPT),  # noqa: F821
-            HumanMessage(content=question),
-        ],
-        "session_id": session_id,
-        "user_id": user_id,
-        "iteration": 0,
-        "tool_calls_made": [],
-    }
-
-    # LangGraph's own recursion guard. AGENT_MAX_ITERATIONS bounds llm-node calls;
-    # double-plus-buffer covers the alternating tools node and the final llm step.
-    final = _graph.invoke(
-        initial,
-        config={"recursion_limit": AGENT_MAX_ITERATIONS * 2 + 5},  # noqa: F821
+        endpoint=llm_endpoint,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
 
-    last = final["messages"][-1]
-    answer = getattr(last, "content", str(last))
-
-    return {
-        "session_id": session_id,
-        "answer": answer or "",
-        "tool_calls": final.get("tool_calls_made", []),
-        "iterations": final.get("iteration", 0),
-    }
+    return create_react_agent(
+        llm,
+        tools=[query_features, query_system_tables, search_knowledge, log_action_record],
+        prompt=system_prompt,
+    )
