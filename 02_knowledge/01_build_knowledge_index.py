@@ -38,11 +38,14 @@ vsc = VectorSearchClient(disable_notice=True)
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 6
+from datetime import timedelta
+
 existing_endpoints = {e["name"] for e in vsc.list_endpoints().get("endpoints", [])}
 if VS_ENDPOINT_NAME not in existing_endpoints:
     print(f"Creating Vector Search endpoint '{VS_ENDPOINT_NAME}' (this can take ~5 min)...")
     vsc.create_endpoint(name=VS_ENDPOINT_NAME, endpoint_type="STANDARD")
-    vsc.wait_for_endpoint(name=VS_ENDPOINT_NAME, timeout=600)
+    vsc.wait_for_endpoint(name=VS_ENDPOINT_NAME, timeout=timedelta(seconds=600))
 print(f"✔ Endpoint '{VS_ENDPOINT_NAME}' ready.")
 
 # COMMAND ----------
@@ -74,3 +77,7 @@ else:
 
 print(f"✔ Index '{VS_INDEX_NAME}' is being populated.")
 print("  Allow a few minutes for the initial embedding pass to complete before querying.")
+
+# COMMAND ----------
+
+
