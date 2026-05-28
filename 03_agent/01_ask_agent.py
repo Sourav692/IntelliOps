@@ -15,7 +15,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q openai databricks-vectorsearch
+# MAGIC %pip install -q langgraph langchain-core databricks-langchain databricks-vectorsearch
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------

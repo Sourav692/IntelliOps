@@ -137,7 +137,7 @@ Recommended cadence:
 
 ## 6. The Support Agent
 
-The agent (`03_agent/`) is **event-driven** — invoked per question, not from the scheduled orchestrator. It uses the Databricks Foundation Model API (`LLM_ENDPOINT_NAME` in config) and the OpenAI-compatible client.
+The agent (`03_agent/`) is **event-driven** — invoked per question, not from the scheduled orchestrator. It is built on **LangGraph** (`StateGraph` with `llm` and `tools` nodes), uses **`ChatDatabricks`** from `databricks-langchain` to call the Databricks Foundation Model endpoint (`LLM_ENDPOINT_NAME` in config), and bounds the tool-call loop at `AGENT_MAX_ITERATIONS`.
 
 ### 6.1 One-time setup (in addition to §4)
 

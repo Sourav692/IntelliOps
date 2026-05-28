@@ -1,8 +1,19 @@
-"""IntelliOps support agent — single-question tool-calling loop.
+"""IntelliOps support agent — LangGraph implementation.
 
-Uses the Databricks Foundation Model Serving endpoint (OpenAI-compatible). Each
-question runs as its own session; every turn is appended to
-`intelliops.memory.agent_conversation`.
+State machine:
+
+    ┌──────────┐         tool_calls          ┌──────────┐
+    │   llm    │ ─────────────────────────►  │  tools   │
+    │  (node)  │ ◄─────────────────────────  │  (node)  │
+    └──────────┘         tool results        └──────────┘
+         │
+         │ no tool_calls
+         ▼
+        END
+
+Each `llm` invocation increments an iteration counter and bails out at
+`AGENT_MAX_ITERATIONS`. Every assistant turn and every tool call is appended to
+`intelliops.memory.agent_conversation` for auditability.
 
 Expected globals from `%run ../config/config`:
   LLM_ENDPOINT_NAME, AGENT_MAX_ITERATIONS, AGENT_TEMPERATURE, AGENT_MAX_TOKENS,
@@ -12,64 +23,231 @@ Expected globals from `%run ../config/config`:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
-import uuid
-import importlib.util
 import sys
-from typing import Any
+import uuid
+from typing import Annotated, Sequence, TypedDict
+
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import tool
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from databricks_langchain import ChatDatabricks
 
 
-def _load_tools_module():
-    """Load the tools.py module sitting next to this file, injecting config globals."""
-    here = os.path.dirname(__file__)
-    spec = importlib.util.spec_from_file_location("ops_agent_tools", os.path.join(here, "tools.py"))
+# ── Module loaders ────────────────────────────────────────────────────────────
+# tools.py and 05_memory/memory.py rely on config constants being present in
+# their module globals (Databricks `%run` pattern). We re-create that by loading
+# them as files and injecting the constants this module already has.
+
+
+def _load_module(path: str, alias: str, injected_globals: dict) -> object:
+    spec = importlib.util.spec_from_file_location(alias, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("could not locate 03_agent/tools.py")
+        raise RuntimeError(f"could not load module from {path}")
     mod = importlib.util.module_from_spec(spec)
-    # Inject config constants tools.py needs.
-    for k in (
-        "TABLE_AGENT_ACTIONS",
-        "TABLE_CONVERSATION",
-        "VS_ENDPOINT_NAME",
-        "VS_INDEX_NAME",
-    ):
-        if k in globals():
-            setattr(mod, k, globals()[k])
-    sys.modules["ops_agent_tools"] = mod
+    for k, v in injected_globals.items():
+        setattr(mod, k, v)
+    sys.modules[alias] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-def _load_memory_module():
-    here = os.path.dirname(__file__)
-    mem_path = os.path.join(here, "..", "05_memory", "memory.py")
-    spec = importlib.util.spec_from_file_location("ops_agent_memory", mem_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("could not locate 05_memory/memory.py")
-    mod = importlib.util.module_from_spec(spec)
-    for k in ("TABLE_CONVERSATION", "TABLE_AGENT_ACTIONS"):
-        if k in globals():
-            setattr(mod, k, globals()[k])
-    sys.modules["ops_agent_memory"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+def _here() -> str:
+    return os.path.dirname(__file__)
 
 
-def _openai_client():
-    """OpenAI-compatible client pointing at the Databricks serving endpoints."""
-    from openai import OpenAI
-    host = (
-        os.environ.get("DATABRICKS_HOST")
-        or "https://" + dbutils.notebook.entry_point.getDbutils()  # type: ignore  # noqa: F821
-            .notebook().getContext().tags().apply("browserHostName")
-    )
-    token = (
-        os.environ.get("DATABRICKS_TOKEN")
-        or dbutils.notebook.entry_point.getDbutils()  # type: ignore  # noqa: F821
-            .notebook().getContext().apiToken().get()
-    )
-    return OpenAI(api_key=token, base_url=f"{host.rstrip('/')}/serving-endpoints")
+def _injected() -> dict:
+    return {
+        k: globals()[k]
+        for k in (
+            "TABLE_AGENT_ACTIONS",
+            "TABLE_CONVERSATION",
+            "VS_ENDPOINT_NAME",
+            "VS_INDEX_NAME",
+        )
+        if k in globals()
+    }
+
+
+# ── Tool wrappers ────────────────────────────────────────────────────────────
+
+
+def _build_tools():
+    tools_mod = _load_module(os.path.join(_here(), "tools.py"), "ops_agent_tools", _injected())
+
+    @tool
+    def query_features(sql: str) -> dict:
+        """Fast path. Run a read-only SELECT against the pre-aggregated IntelliOps
+        feature tables (intelliops.feature_store.*) or the stable report views
+        (intelliops.report.*). Use this for the common case."""
+        return tools_mod.query_features(sql)
+
+    @tool
+    def query_system_tables(sql: str) -> dict:
+        """Escape hatch. Read-only SELECT against system.billing.*, system.compute.*,
+        or system.lakeflow.*. Use only when the data is not pre-aggregated or when
+        freshness within the last ~15 minutes is required."""
+        return tools_mod.query_system_tables(sql)
+
+    @tool
+    def search_knowledge(query: str, num_results: int = 4) -> dict:
+        """Semantic search over IntelliOps's curated knowledge corpus (pricing
+        notes, cost-optimization best practices, internal runbooks). Use when the
+        user asks 'why' / 'best practice' / 'how should I'."""
+        return tools_mod.search_knowledge(query, num_results)
+
+    @tool
+    def log_action_record(
+        skill_name: str,
+        action_type: str,
+        target_id: str,
+        target_name: str,
+        description: str,
+        projected_savings: float = 0.0,
+        status: str = "proposed",
+        workspace_id: str | None = None,
+    ) -> dict:
+        """Persist a recommendation to the agent action log so it appears on the
+        Optimization Leaderboard. Call when you have delivered a concrete
+        recommendation tied to a specific Databricks resource."""
+        return tools_mod.log_action_record(
+            skill_name=skill_name,
+            action_type=action_type,
+            target_id=target_id,
+            target_name=target_name,
+            description=description,
+            projected_savings=projected_savings,
+            status=status,
+            workspace_id=workspace_id,
+        )
+
+    return [query_features, query_system_tables, search_knowledge, log_action_record]
+
+
+# ── State ────────────────────────────────────────────────────────────────────
+
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    session_id: str
+    user_id: str | None
+    iteration: int
+    tool_calls_made: list[dict]
+
+
+# ── Graph build (lazy, cached) ───────────────────────────────────────────────
+
+_graph = None
+_memory = None
+
+
+def _get_memory():
+    global _memory
+    if _memory is None:
+        _memory = _load_module(
+            os.path.join(_here(), "..", "05_memory", "memory.py"),
+            "ops_agent_memory",
+            _injected(),
+        )
+    return _memory
+
+
+def _build_graph():
+    tools_list = _build_tools()
+    tools_by_name = {t.name: t for t in tools_list}
+
+    llm = ChatDatabricks(
+        endpoint=LLM_ENDPOINT_NAME,            # noqa: F821
+        temperature=AGENT_TEMPERATURE,          # noqa: F821
+        max_tokens=AGENT_MAX_TOKENS,            # noqa: F821
+    ).bind_tools(tools_list)
+
+    def llm_node(state: AgentState) -> dict:
+        if state["iteration"] >= AGENT_MAX_ITERATIONS:  # noqa: F821
+            stop_msg = AIMessage(
+                content="Stopped — reached the tool-call iteration cap."
+            )
+            return {"messages": [stop_msg]}
+
+        response = llm.invoke(state["messages"])
+        _get_memory().log_turn(
+            state["session_id"],
+            "assistant",
+            response.content or "",
+            user_id=state.get("user_id"),
+        )
+        return {"messages": [response], "iteration": state["iteration"] + 1}
+
+    def tools_node(state: AgentState) -> dict:
+        last = state["messages"][-1]
+        if not isinstance(last, AIMessage) or not last.tool_calls:
+            return {}
+
+        memory = _get_memory()
+        outputs: list[ToolMessage] = []
+        records: list[dict] = []
+
+        for tc in last.tool_calls:
+            name = tc["name"]
+            args = tc.get("args") or {}
+            fn = tools_by_name.get(name)
+            if fn is None:
+                result = {"error": f"unknown tool '{name}'"}
+            else:
+                try:
+                    result = fn.invoke(args)
+                except Exception as e:
+                    result = {"error": str(e)}
+
+            outputs.append(
+                ToolMessage(
+                    content=json.dumps(result, default=str)[:8000],
+                    name=name,
+                    tool_call_id=tc["id"],
+                )
+            )
+            records.append({"name": name, "args": json.dumps(args), "result": result})
+
+            memory.log_turn(
+                state["session_id"],
+                "tool",
+                content="",
+                tool_name=name,
+                tool_args=args,
+                tool_result=result,
+                user_id=state.get("user_id"),
+            )
+
+        return {
+            "messages": outputs,
+            "tool_calls_made": state.get("tool_calls_made", []) + records,
+        }
+
+    def should_continue(state: AgentState) -> str:
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage) and last.tool_calls:
+            return "tools"
+        return END
+
+    graph = StateGraph(AgentState)
+    graph.add_node("llm", llm_node)
+    graph.add_node("tools", tools_node)
+    graph.add_edge(START, "llm")
+    graph.add_conditional_edges("llm", should_continue, {"tools": "tools", END: END})
+    graph.add_edge("tools", "llm")
+    return graph.compile()
+
+
+# ── Public API (unchanged signature) ─────────────────────────────────────────
 
 
 def ask(
@@ -77,92 +255,42 @@ def ask(
     user_id: str | None = None,
     session_id: str | None = None,
 ) -> dict:
-    """Run one user question through the agent loop.
+    """Run one user question through the LangGraph agent.
 
-    Returns:
-      {
-        "session_id": str,
-        "answer": str,
-        "tool_calls": list[dict],
-        "iterations": int,
-      }
+    Returns: {session_id, answer, tool_calls, iterations}.
     """
-    tools_mod = _load_tools_module()
-    mem = _load_memory_module()
-    client = _openai_client()
+    global _graph
+    if _graph is None:
+        _graph = _build_graph()
 
+    memory = _get_memory()
     session_id = session_id or str(uuid.uuid4())
+    memory.log_turn(session_id, "user", question, user_id=user_id)
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},  # noqa: F821
-        {"role": "user", "content": question},
-    ]
-    mem.log_turn(session_id, "user", question, user_id=user_id)
+    initial: AgentState = {
+        "messages": [
+            SystemMessage(content=AGENT_SYSTEM_PROMPT),  # noqa: F821
+            HumanMessage(content=question),
+        ],
+        "session_id": session_id,
+        "user_id": user_id,
+        "iteration": 0,
+        "tool_calls_made": [],
+    }
 
-    tool_calls_made: list[dict] = []
-    iterations = 0
+    # LangGraph's own recursion guard. AGENT_MAX_ITERATIONS bounds llm-node calls;
+    # double-plus-buffer covers the alternating tools node and the final llm step.
+    final = _graph.invoke(
+        initial,
+        config={"recursion_limit": AGENT_MAX_ITERATIONS * 2 + 5},  # noqa: F821
+    )
 
-    while iterations < AGENT_MAX_ITERATIONS:  # noqa: F821
-        iterations += 1
-        resp = client.chat.completions.create(
-            model=LLM_ENDPOINT_NAME,  # noqa: F821
-            messages=messages,
-            tools=tools_mod.TOOL_SCHEMAS,
-            tool_choice="auto",
-            temperature=AGENT_TEMPERATURE,    # noqa: F821
-            max_tokens=AGENT_MAX_TOKENS,      # noqa: F821
-        )
-        msg = resp.choices[0].message
-        # Reflect the assistant turn back into the running messages list.
-        assistant_turn: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            assistant_turn["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(assistant_turn)
+    last = final["messages"][-1]
+    answer = getattr(last, "content", str(last))
 
-        if not msg.tool_calls:
-            # Final answer.
-            mem.log_turn(session_id, "assistant", msg.content or "", user_id=user_id)
-            return {
-                "session_id": session_id,
-                "answer": msg.content or "",
-                "tool_calls": tool_calls_made,
-                "iterations": iterations,
-            }
-
-        # Execute every requested tool call, append results, loop.
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            args_json = tc.function.arguments or "{}"
-            result = tools_mod.call_tool(name, args_json)
-            tool_calls_made.append({"name": name, "args": args_json, "result": result})
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "name": name,
-                "content": json.dumps(result, default=str)[:8000],  # cap context bloat
-            })
-            mem.log_turn(
-                session_id,
-                "tool",
-                content="",
-                tool_name=name,
-                tool_args=json.loads(args_json) if args_json else {},
-                tool_result=result,
-                user_id=user_id,
-            )
-
-    # Loop cap hit — return whatever we have.
     return {
         "session_id": session_id,
-        "answer": "Stopped before completing — reached the tool-call iteration cap.",
-        "tool_calls": tool_calls_made,
-        "iterations": iterations,
+        "answer": answer or "",
+        "tool_calls": final.get("tool_calls_made", []),
+        "iterations": final.get("iteration", 0),
     }

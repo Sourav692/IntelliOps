@@ -1,118 +1,17 @@
-"""Tool implementations + JSON schemas exposed to the LLM.
+"""Tool implementations used by the LangGraph agent.
 
-Each tool is a pure function that returns a JSON-serializable value. The agent
-loop is responsible for calling them, formatting the result back into the chat,
-and logging the call to memory.
+Each function is a pure callable that returns a JSON-serializable dict. The
+agent (in `agent.py`) wraps these with LangChain's `@tool` decorator so the
+LLM can call them through the LangGraph state machine.
 
-Constants (`TABLE_*`, `REPORT_SCHEMA`, `MEMORY_SCHEMA`, etc.) are expected to
-be in the module's globals via `%run ../config/config` before import.
+Constants (`TABLE_AGENT_ACTIONS`, `TABLE_CONVERSATION`, `VS_ENDPOINT_NAME`,
+`VS_INDEX_NAME`) are expected to be in the module's globals via
+`%run ../config/config` (or injected by `agent.py`'s loader) before use.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
-
-
-# ── Tool definitions exposed to the LLM (OpenAI tool-call schema) ────────────
-TOOL_SCHEMAS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query_features",
-            "description": (
-                "Fast path. Run a read-only SQL query against the pre-aggregated "
-                "IntelliOps feature tables (intelliops.feature_store.*) or the "
-                "stable report views (intelliops.report.*). Use this for the "
-                "common questions: cost by job, utilization by cluster, failure "
-                "rates, savings captured. Returns up to 50 rows."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": (
-                            "A single SELECT statement. Must read from "
-                            "intelliops.feature_store.* or intelliops.report.* only."
-                        ),
-                    }
-                },
-                "required": ["sql"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_system_tables",
-            "description": (
-                "Escape hatch. Run a read-only SQL query against system.* tables "
-                "directly. Use this only when (a) the requested data is not "
-                "pre-aggregated in a feature table, or (b) freshness within the "
-                "last ~15 minutes is required. Returns up to 50 rows."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": (
-                            "A single SELECT statement reading from system.billing.*, "
-                            "system.compute.*, or system.lakeflow.* only."
-                        ),
-                    }
-                },
-                "required": ["sql"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_knowledge",
-            "description": (
-                "Semantic search over IntelliOps's curated knowledge corpus "
-                "(pricing notes, cost-optimization best practices, internal runbooks). "
-                "Use when the user asks 'why', 'best practice', 'how should I', or "
-                "needs context the data tables can't provide."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Natural-language query."},
-                    "num_results": {"type": "integer", "default": 4},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "log_action_record",
-            "description": (
-                "Persist a recommendation or finding to the agent action log so it "
-                "appears on the Optimization Leaderboard. Call this when you have "
-                "delivered a concrete recommendation with a target resource."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name":        {"type": "string"},
-                    "action_type":       {"type": "string", "description": "alert | recommendation"},
-                    "target_id":         {"type": "string"},
-                    "target_name":       {"type": "string"},
-                    "description":       {"type": "string"},
-                    "projected_savings": {"type": "number", "default": 0},
-                    "status":            {"type": "string", "default": "proposed"},
-                    "workspace_id":      {"type": "string"},
-                },
-                "required": ["skill_name", "action_type", "target_id", "target_name", "description"],
-            },
-        },
-    },
-]
 
 
 # ── Tool implementations ─────────────────────────────────────────────────────
@@ -216,21 +115,3 @@ def log_action_record(
     return {"action_id": action_id, "status": status}
 
 
-# ── Dispatcher used by the agent loop ────────────────────────────────────────
-
-DISPATCH = {
-    "query_features": query_features,
-    "query_system_tables": query_system_tables,
-    "search_knowledge": search_knowledge,
-    "log_action_record": log_action_record,
-}
-
-
-def call_tool(name: str, args_json: str) -> Any:
-    if name not in DISPATCH:
-        return {"error": f"unknown tool '{name}'"}
-    try:
-        args = json.loads(args_json) if args_json else {}
-    except json.JSONDecodeError as e:
-        return {"error": f"bad arguments JSON: {e}"}
-    return DISPATCH[name](**args)
