@@ -43,15 +43,25 @@ FROM {TABLE_JOB_HEALTH}
 
 spark.sql(f"""
 CREATE OR REPLACE VIEW {REPORT_SCHEMA}.job_daily_failure_trend AS
+WITH per_run AS (
+    -- One row per run, dated by when the run started.
+    SELECT
+        workspace_id, job_id, run_id,
+        DATE(MIN(period_start_time))                                  AS run_date,
+        MAX(CASE WHEN result_state IS NOT NULL THEN result_state END) AS result_state
+    FROM {SYS_LAKEFLOW_JOB_RUNS}
+    WHERE period_start_time >= CURRENT_DATE - INTERVAL 30 DAYS
+    GROUP BY workspace_id, job_id, run_id
+)
 SELECT
-    DATE(period_start_time)                                 AS run_date,
+    run_date,
     COUNT(*)                                                AS total_runs,
     SUM(CASE WHEN result_state = 'FAILED' THEN 1 ELSE 0 END) AS failures,
     ROUND(SUM(CASE WHEN result_state = 'FAILED' THEN 1 ELSE 0 END) * 100.0
         / COUNT(*), 2)                                      AS failure_rate_pct
-FROM {SYS_LAKEFLOW_JOB_RUNS}
-WHERE period_start_time >= CURRENT_DATE - INTERVAL 30 DAYS
-GROUP BY DATE(period_start_time)
+FROM per_run
+WHERE result_state IS NOT NULL    -- Exclude still-in-flight runs
+GROUP BY run_date
 ORDER BY run_date
 """)
 
@@ -112,16 +122,29 @@ LIMIT 15
 
 spark.sql(f"""
 CREATE OR REPLACE VIEW {REPORT_SCHEMA}.job_duration_anomalies AS
-WITH latest_runs AS (
+WITH per_run AS (
+    -- Collapse multi-period timeline rows to one row per actual run.
     SELECT
-        workspace_id, job_id,
-        TIMESTAMPDIFF(SECOND, period_start_time, period_end_time) AS duration_secs,
-        period_start_time,
-        ROW_NUMBER() OVER (
-            PARTITION BY workspace_id, job_id ORDER BY period_start_time DESC
-        ) AS rn
+        workspace_id, job_id, run_id,
+        MIN(period_start_time)                                        AS run_start,
+        MAX(period_end_time)                                          AS run_end,
+        MAX(CASE WHEN result_state IS NOT NULL THEN result_state END) AS result_state
     FROM {SYS_LAKEFLOW_JOB_RUNS}
     WHERE period_start_time >= CURRENT_DATE - INTERVAL 7 DAYS
+    GROUP BY workspace_id, job_id, run_id
+),
+latest_runs AS (
+    SELECT
+        workspace_id, job_id,
+        TIMESTAMPDIFF(SECOND, run_start, run_end) AS duration_secs,
+        run_start,
+        ROW_NUMBER() OVER (
+            PARTITION BY workspace_id, job_id ORDER BY run_start DESC
+        ) AS rn
+    FROM per_run
+    WHERE result_state IS NOT NULL
+      AND run_end IS NOT NULL
+      AND run_end >= run_start
 )
 SELECT
     h.job_name,

@@ -25,29 +25,58 @@ from datetime import datetime
 # COMMAND ----------
 
 df_job_health = spark.sql(f"""
-    WITH run_stats AS (
+    WITH latest_jobs AS (
+        -- One row per (workspace_id, job_id): the most recent job definition.
+        -- system.lakeflow.jobs is an SCD-2 table; joining without this filter
+        -- multiplies every run by the number of historical job versions.
+        SELECT workspace_id, job_id, name AS job_name
+        FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY workspace_id, job_id ORDER BY change_time DESC
+            ) AS _rn
+            FROM {SYS_LAKEFLOW_JOBS}
+        )
+        WHERE _rn = 1
+    ),
+    per_run AS (
+        -- Collapse multi-period rows (streaming / state-transition timelines)
+        -- into one row per run_id with a single start/end and final state.
         SELECT
-            r.workspace_id,
-            r.job_id,
-            j.name                                          AS job_name,
-            COUNT(*)                                        AS total_runs,
-            SUM(CASE WHEN r.result_state = 'FAILED'
-                     THEN 1 ELSE 0 END)                    AS failed_runs,
-            AVG(
-                TIMESTAMPDIFF(SECOND, r.period_start_time, r.period_end_time)
-            )                                               AS avg_duration_secs,
-            STDDEV(
-                TIMESTAMPDIFF(SECOND, r.period_start_time, r.period_end_time)
-            )                                               AS stddev_duration,
-            MAX(
-                TIMESTAMPDIFF(SECOND, r.period_start_time, r.period_end_time)
-            )                                               AS max_duration_secs
-        FROM {SYS_LAKEFLOW_JOB_RUNS} r
-        LEFT JOIN {SYS_LAKEFLOW_JOBS} j
-            ON r.workspace_id = j.workspace_id
-            AND r.job_id = j.job_id
-        WHERE r.period_start_time >= CURRENT_DATE - INTERVAL {JOB_HEALTH_LOOKBACK_DAYS} DAYS
-        GROUP BY r.workspace_id, r.job_id, j.name
+            workspace_id,
+            job_id,
+            run_id,
+            MIN(period_start_time)                                          AS run_start,
+            MAX(period_end_time)                                            AS run_end,
+            MAX(CASE WHEN result_state IS NOT NULL THEN result_state END)   AS result_state
+        FROM {SYS_LAKEFLOW_JOB_RUNS}
+        WHERE period_start_time >= CURRENT_DATE - INTERVAL {JOB_HEALTH_LOOKBACK_DAYS} DAYS
+        GROUP BY workspace_id, job_id, run_id
+    ),
+    completed_runs AS (
+        -- Only runs that actually finished — drop in-flight / queued-only entries
+        -- that would otherwise inflate avg/max duration.
+        SELECT
+            workspace_id, job_id, run_id, result_state,
+            TIMESTAMPDIFF(SECOND, run_start, run_end) AS duration_secs
+        FROM per_run
+        WHERE result_state IS NOT NULL
+          AND run_end IS NOT NULL
+          AND run_end >= run_start
+    ),
+    run_stats AS (
+        SELECT
+            cr.workspace_id,
+            cr.job_id,
+            j.job_name,
+            COUNT(*)                                                    AS total_runs,
+            SUM(CASE WHEN cr.result_state = 'FAILED' THEN 1 ELSE 0 END) AS failed_runs,
+            AVG(cr.duration_secs)                                       AS avg_duration_secs,
+            STDDEV(cr.duration_secs)                                    AS stddev_duration,
+            MAX(cr.duration_secs)                                       AS max_duration_secs
+        FROM completed_runs cr
+        LEFT JOIN latest_jobs j
+            ON cr.workspace_id = j.workspace_id AND cr.job_id = j.job_id
+        GROUP BY cr.workspace_id, cr.job_id, j.job_name
     )
     SELECT
         *,
@@ -113,17 +142,31 @@ df_unreliable.display()
 # COMMAND ----------
 
 df_anomalies = spark.sql(f"""
-    WITH latest_runs AS (
+    WITH per_run AS (
         SELECT
             workspace_id,
             job_id,
-            TIMESTAMPDIFF(SECOND, period_start_time, period_end_time) AS duration_secs,
-            ROW_NUMBER() OVER (
-                PARTITION BY workspace_id, job_id
-                ORDER BY period_start_time DESC
-            ) AS rn
+            run_id,
+            MIN(period_start_time)                                        AS run_start,
+            MAX(period_end_time)                                          AS run_end,
+            MAX(CASE WHEN result_state IS NOT NULL THEN result_state END) AS result_state
         FROM {SYS_LAKEFLOW_JOB_RUNS}
         WHERE period_start_time >= CURRENT_DATE - INTERVAL 7 DAYS
+        GROUP BY workspace_id, job_id, run_id
+    ),
+    latest_runs AS (
+        SELECT
+            workspace_id,
+            job_id,
+            TIMESTAMPDIFF(SECOND, run_start, run_end) AS duration_secs,
+            ROW_NUMBER() OVER (
+                PARTITION BY workspace_id, job_id
+                ORDER BY run_start DESC
+            ) AS rn
+        FROM per_run
+        WHERE result_state IS NOT NULL
+          AND run_end IS NOT NULL
+          AND run_end >= run_start
     )
     SELECT
         h.workspace_id,
