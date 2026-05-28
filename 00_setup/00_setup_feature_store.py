@@ -123,3 +123,7 @@ print(f"{'='*60}")
 for t in tables:
     print(f"  • {FULL_SCHEMA}.{t.tableName}")
 print(f"{'='*60}")
+
+# COMMAND ----------
+
+

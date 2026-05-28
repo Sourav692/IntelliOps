@@ -31,8 +31,8 @@ from databricks.sdk import WorkspaceClient
 
 # COMMAND ----------
 
-dbutils.widgets.text("warehouse_id", "", "SQL Warehouse ID")
-dbutils.widgets.text("parent_path", "", "Workspace parent path (e.g. /Workspace/Users/you@co.com)")
+dbutils.widgets.text("warehouse_id", "4b9b953939869799", "SQL Warehouse ID")
+dbutils.widgets.text("parent_path", "/Workspace/Users/sourav.banerjee@databricks.com/", "Workspace parent path (e.g. /Workspace/Users/you@co.com)")
 dbutils.widgets.text("display_name", "IntelliOps Cost Observability", "Dashboard display name")
 
 WAREHOUSE_ID = dbutils.widgets.get("warehouse_id").strip()
@@ -175,19 +175,22 @@ print(f"Built dashboard with {len(dashboard['datasets'])} datasets across {len(d
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 11
 w = WorkspaceClient()
 
-created = w.lakeview.create(
-    display_name=DISPLAY_NAME,
-    parent_path=PARENT_PATH,
-    warehouse_id=WAREHOUSE_ID,
-    serialized_dashboard=serialized,
-)
+body = {
+    "display_name": DISPLAY_NAME,
+    "parent_path": PARENT_PATH,
+    "warehouse_id": WAREHOUSE_ID,
+    "serialized_dashboard": serialized,
+}
+created = w.api_client.do("POST", "/api/2.0/lakeview/dashboards", body=body)
 
-print(f"✔ Dashboard created.")
-print(f"  dashboard_id : {created.dashboard_id}")
-print(f"  path         : {created.path}")
-print(f"  Open it at   : {spark.conf.get('spark.databricks.workspaceUrl', 'https://<workspace>')}/dashboards/{created.dashboard_id}")
+host = w.config.host.rstrip("/")
+print(f"\u2714 Dashboard created.")
+print(f"  dashboard_id : {created['dashboard_id']}")
+print(f"  path         : {created.get('path', 'N/A')}")
+print(f"  Open it at   : {host}/dashboards/{created['dashboard_id']}")
 
 # COMMAND ----------
 

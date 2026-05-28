@@ -113,10 +113,10 @@ if RUN_REPORT:
     print("\n▶ Stage 3: REPORT — Refreshing dashboards...")
 
     reports = [
-        "01_cost_command_center",
+        # "01_cost_command_center",
         "02_cluster_health_map",
-        "03_job_reliability",
-        "04_optimization_leaderboard",
+        # "03_job_reliability",
+        # "04_optimization_leaderboard",
     ]
 
     for report_name in reports:
@@ -161,3 +161,7 @@ if failed > 0:
 print(f"\nNote: the support agent (03_agent) is event-driven via 06_interface")
 print(f"      and is intentionally not invoked from the orchestrator.")
 print(f"{'='*60}")
+
+# COMMAND ----------
+
+
