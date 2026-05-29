@@ -1,0 +1,135 @@
+# IntelliOps — Job definitions
+#
+# Five Jobs, each with one or more tasks. All run on **serverless compute**
+# (no job_cluster_key / existing_cluster_id). If your workspace doesn't have
+# serverless enabled, add a `job_clusters:` block per job and set
+# `job_cluster_key:` on each task.
+#
+# Notebook paths are relative to *this* YAML file → "../" reaches the bundle root.
+
+resources:
+  jobs:
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. One-shot setup
+    # ──────────────────────────────────────────────────────────────────────
+    intelliops_setup:
+      name: "[IntelliOps] Setup (one-shot)"
+      description: >
+        Creates the Unity Catalog catalog, schemas, and Delta tables that
+        IntelliOps owns. Run this once after deploying the bundle.
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: setup_feature_store
+          notebook_task:
+            notebook_path: ../00_setup/00_setup_feature_store.py
+
+        - task_key: setup_memory
+          depends_on:
+            - task_key: setup_feature_store
+          notebook_task:
+            notebook_path: ../05_memory/00_setup_memory.py
+
+        - task_key: seed_knowledge_docs
+          depends_on:
+            - task_key: setup_memory
+          notebook_task:
+            notebook_path: ../02_knowledge/00_seed_knowledge_docs.py
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Observe — every 15 min (refreshes feature tables + fast reconciliation)
+    # ──────────────────────────────────────────────────────────────────────
+    intelliops_observe:
+      name: "[IntelliOps] Observe — refresh feature store"
+      description: Rebuilds intelliops.feature_store.* every 15 minutes.
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: ${var.observe_cron}
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: feat_cluster_utilization
+          notebook_task:
+            notebook_path: ../01_observe/01_feat_cluster_utilization.py
+
+        - task_key: feat_job_cost_trend
+          notebook_task:
+            notebook_path: ../01_observe/02_feat_job_cost_trend.py
+
+        - task_key: feat_job_health
+          notebook_task:
+            notebook_path: ../01_observe/03_feat_job_health.py
+
+        - task_key: reconcile_fast
+          depends_on:
+            - task_key: feat_cluster_utilization
+            - task_key: feat_job_cost_trend
+            - task_key: feat_job_health
+          notebook_task:
+            notebook_path: ../01_observe/99_reconcile_feature_store.py
+            base_parameters:
+              mode: fast
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Report — daily (rebuilds intelliops.report.* views)
+    # ──────────────────────────────────────────────────────────────────────
+    intelliops_report:
+      name: "[IntelliOps] Report — refresh dashboard views"
+      description: Republishes intelliops.report.* views from feature tables.
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: ${var.report_cron}
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: cost_command_center
+          notebook_task:
+            notebook_path: ../07_report/01_cost_command_center.py
+
+        - task_key: cluster_health_map
+          notebook_task:
+            notebook_path: ../07_report/02_cluster_health_map.py
+
+        - task_key: job_reliability
+          notebook_task:
+            notebook_path: ../07_report/03_job_reliability.py
+
+        - task_key: optimization_leaderboard
+          notebook_task:
+            notebook_path: ../07_report/04_optimization_leaderboard.py
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. Knowledge — weekly (rebuilds the RAG vector-search index)
+    # ──────────────────────────────────────────────────────────────────────
+    intelliops_knowledge:
+      name: "[IntelliOps] Knowledge — refresh RAG index"
+      description: Re-embeds intelliops.knowledge.knowledge_docs into Vector Search.
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: ${var.knowledge_cron}
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: build_knowledge_index
+          notebook_task:
+            notebook_path: ../02_knowledge/01_build_knowledge_index.py
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 5. Reconcile (full) — daily (deep cross-check against system.*)
+    # ──────────────────────────────────────────────────────────────────────
+    intelliops_reconcile_full:
+      name: "[IntelliOps] Reconciliation — full"
+      description: >
+        Runs every check in doc/data_reconciliation.md against system.*. Fails
+        loudly (raises RuntimeError) on any critical mismatch.
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: ${var.reconcile_cron}
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: reconcile_full
+          notebook_task:
+            notebook_path: ../01_observe/99_reconcile_feature_store.py
+            base_parameters:
+              mode: full

@@ -162,8 +162,21 @@ Always-on dashboard tabs: Cost Command Center, Cluster Health Map, Job Reliabili
 ### `08_eval/` — Evaluation
 Golden set of ~50 cost questions with expected answer shape and required tool calls. Run on each agent prompt change. Without this, agent quality is unmeasurable.
 
-### `orchestrator.py` — Scheduled Work
-Runs Observe (15-min) and Knowledge/Report (daily). **Does not invoke the agent** — the agent is event-driven via the Interface.
+### `orchestrator.py` — Manual / Ad-hoc Runner
+Sequential runner with toggle flags (`RUN_OBSERVE` / `RUN_KNOWLEDGE` / `RUN_REPORT`). Useful for one-offs and dev-loop testing. **Does not invoke the agent.**
+
+### `databricks.yml` + `resources/intelliops_jobs.yml` — Production Scheduling (DAB)
+Production scheduling is managed declaratively via a **Databricks Asset Bundle**. The bundle defines five Jobs, each on its own schedule and with task-level dependencies:
+
+| Job | Cadence | What it does |
+|---|---|---|
+| `intelliops_setup` | Manual | DDL for catalog, schemas, all Delta tables; seeds the knowledge corpus. |
+| `intelliops_observe` | Every 15 min | Rebuilds `feature_store.*` (3 tasks in parallel); runs fast reconciliation after. |
+| `intelliops_report` | Daily 05:00 UTC | Republishes the 18 views in `intelliops.report.*` (4 tasks in parallel). |
+| `intelliops_knowledge` | Weekly Sun 06:00 UTC | Re-embeds the RAG corpus. |
+| `intelliops_reconcile_full` | Daily 07:00 UTC | Deep cross-check against `system.*`; raises on any 🔴 critical mismatch. |
+
+All run on serverless compute. **The bundle is the source of truth for schedules** — never edit Jobs in the workspace UI; edit `resources/intelliops_jobs.yml` and redeploy with `databricks bundle deploy`.
 
 ## 5. Key Design Decisions
 
@@ -173,6 +186,7 @@ Runs Observe (15-min) and Knowledge/Report (daily). **Does not invoke the agent*
 | System tables + Delta features only | Portable across workspaces; no agent install. |
 | Feature tables are a **cache**, not a moat | `system.*` is the source of truth. Features exist to amortize the DBU→USD join + windowed aggregations, and to give dashboards low-latency reads. Drop a feature table when nothing queries it. |
 | Report notebooks publish **stable views**, not inline output | Dashboards bind to `intelliops.report.<name>`. Notebook logic can change without breaking tiles, as long as the view name + columns stay compatible. |
+| Production scheduling lives in a **Databricks Asset Bundle**, not the workspace UI | Schedules + task graphs + retry policy are versioned alongside the code that runs them. `databricks bundle deploy` is the one way to ship changes; UI-level edits will drift and get clobbered on the next deploy. |
 | Agent has both `query_features` and `query_system_tables` | Fast path for the 80% case; escape hatch for freshness or long-tail aggregations. Without the escape hatch, staleness would force feature-table churn. |
 | Knowledge layer with RAG | Agent can cite pricing docs and runbooks, not just hallucinate. |
 | Single agent orchestrator | Simpler routing; split later only if eval demands it. |

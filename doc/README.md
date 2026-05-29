@@ -88,50 +88,51 @@ This creates: `intelliops.feature_store.{feat_cluster_utilization, feat_job_cost
 
 ## 5. Run the Scheduled Pipeline
 
-`orchestrator.py` runs the **scheduled** stages only: **Observe → Knowledge → Report**. The support agent itself is event-driven (see §6) and is *not* invoked here.
+There are two paths. **Use the Asset Bundle** for production; `orchestrator.py` stays as a manual-run option for one-offs.
 
-> **What runs today:** only Observe and Report. Knowledge is **wired into the orchestrator but its notebook (**`02_knowledge/01_build_knowledge_index`**) does not exist yet** — that module is a placeholder (see §10). `RUN_KNOWLEDGE` therefore defaults to `False`; flip it to `True` only after the Knowledge module is implemented.
+### Option A — Databricks Asset Bundle *(recommended for production)*
 
-### Option A — Manual run (good for first validation)
+The repo ships a complete bundle (`databricks.yml` + `resources/intelliops_jobs.yml`) that creates **five Jobs**, each on the right schedule:
 
-Open `orchestrator.py`, attach to a cluster, **Run All**. Tail the output; each stage prints `✔` / `❌` per notebook.
+| Job | What it does | Schedule |
+| --- | --- | --- |
+| `intelliops_setup` | One-shot: creates catalog, schemas, all Delta tables, seeds knowledge docs | Manual trigger |
+| `intelliops_observe` | Refreshes `intelliops.feature_store.*` + runs fast reconciliation | Every 15 min |
+| `intelliops_report` | Republishes `intelliops.report.*` views | Daily 05:00 UTC |
+| `intelliops_knowledge` | Re-embeds the RAG corpus into Vector Search | Sundays 06:00 UTC |
+| `intelliops_reconcile_full` | Deep cross-check against `system.*`; fails loudly on any mismatch | Daily 07:00 UTC |
 
-### Option B — Scheduled Databricks Job (recommended)
+All run on serverless compute (no cluster spec needed).
 
-Create one job with three tasks at different cadences, or three separate jobs. Example single-job spec:
+**Deploy the bundle:**
 
-```json
-{
-  "name": "IntelliOps",
-  "tasks": [
-    {
-      "task_key": "observe",
-      "notebook_task": {"notebook_path": "/Workspace/Repos/<you>/IntelliOps/orchestrator", "base_parameters": {"RUN_OBSERVE": "true", "RUN_KNOWLEDGE": "false", "RUN_REPORT": "false"}},
-      "new_cluster": {"spark_version": "14.3.x-scala2.12", "node_type_id": "i3.xlarge", "num_workers": 1},
-      "schedule": {"quartz_cron_expression": "0 */15 * * * ?", "timezone_id": "UTC"}
-    },
-    {
-      "task_key": "report",
-      "notebook_task": {"notebook_path": "/Workspace/Repos/<you>/IntelliOps/orchestrator", "base_parameters": {"RUN_OBSERVE": "false", "RUN_KNOWLEDGE": "false", "RUN_REPORT": "true"}},
-      "depends_on": [{"task_key": "observe"}]
-    },
-    {
-      "task_key": "knowledge",
-      "_comment": "Enable only after 02_knowledge/01_build_knowledge_index exists.",
-      "notebook_task": {"notebook_path": "/Workspace/Repos/<you>/IntelliOps/orchestrator", "base_parameters": {"RUN_OBSERVE": "false", "RUN_KNOWLEDGE": "true", "RUN_REPORT": "false"}},
-      "schedule": {"quartz_cron_expression": "0 0 6 ? * SUN", "timezone_id": "UTC"}
-    }
-  ]
-}
+```bash
+# From the repo root, with the Databricks CLI configured for your workspace:
+
+databricks bundle validate                    # sanity-check the YAML
+
+databricks bundle deploy --target dev          # ships notebooks + jobs (schedules PAUSED)
+databricks bundle run intelliops_setup --target dev    # creates UC objects
+
+# When you're happy, deploy to prod (schedules UNPAUSED):
+databricks bundle deploy --target prod
 ```
 
-Recommended cadence:
+**Override variables per environment** (e.g. failure email, cron expressions):
 
-| Stage | Cadence |
-| --- | --- |
-| Observe | every 15 min |
-| Report | daily |
-| Knowledge | weekly |
+```bash
+databricks bundle deploy --target prod \
+  --var notification_email=oncall@example.com \
+  --var observe_cron='0 */10 * * * ?'
+```
+
+To pause / resume the schedule without redeploying, edit `pause_status` in `resources/intelliops_jobs.yml` and redeploy, or pause from the Jobs UI.
+
+### Option B — Manual run via `orchestrator.py` *(useful for ad-hoc validation)*
+
+`orchestrator.py` runs Observe → Knowledge → Report sequentially with toggle flags. Open it, attach to any cluster, **Run All**. Output shows `✔` / `❌` per notebook. The bundle deploys this notebook too, but the scheduled Jobs above call individual notebooks directly so they parallelize and isolate failures per task.
+
+> **What runs today:** Setup is one-shot; Observe runs every 15 min and includes the fast reconciliation check; Report runs daily; Knowledge runs weekly; the full reconciliation runs daily and will hard-fail the pipeline if any 🔴 critical mismatch with `system.*` is detected (see [`doc/data_reconciliation.md`](./data_reconciliation.md)).
 
 ---
 

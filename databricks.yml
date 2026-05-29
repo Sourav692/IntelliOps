@@ -1,19 +1,43 @@
-# This is a Databricks asset bundle definition for IntelliOps.
-# The Databricks extension requires databricks.yml configuration file.
-# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+# IntelliOps — Databricks Asset Bundle
+# Deploys five Jobs that create and refresh every UC table & view this framework owns.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for DAB docs.
 
 bundle:
   name: IntelliOps
 
+include:
+  - resources/*.yml
+
+variables:
+  notification_email:
+    description: Email to notify on job failures (leave blank to disable).
+    default: ""
+  observe_cron:
+    description: Cron for the Observe job (every 15 minutes by default).
+    default: "0 */15 * * * ?"
+  report_cron:
+    description: Cron for the Report job (daily 05:00 UTC by default).
+    default: "0 0 5 * * ?"
+  knowledge_cron:
+    description: Cron for the Knowledge index refresh (Sundays 06:00 UTC).
+    default: "0 0 6 ? * SUN"
+  reconcile_cron:
+    description: Cron for the daily full reconciliation (07:00 UTC).
+    default: "0 0 7 * * ?"
+
 targets:
+
   dev:
-    mode: development
+    mode: development     # Adds [dev <user>] prefix to resource names; PAUSED schedules.
     default: true
     workspace:
       host: https://e2-demo-field-eng.cloud.databricks.com
 
-  ## Optionally, there could be 'staging' or 'prod' targets here.
-  #
-  # prod:
-  #   workspace:
-  #     host: https://e2-demo-field-eng.cloud.databricks.com
+  prod:
+    mode: production
+    workspace:
+      host: https://e2-demo-field-eng.cloud.databricks.com
+      root_path: /Workspace/Apps/intelliops
+    # Override these in your CI / per-environment vars file as needed.
+    # run_as:
+    #   service_principal_name: <sp-application-id>
